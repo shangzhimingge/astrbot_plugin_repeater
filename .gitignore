@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 版本控制与编辑器
+.git/
+.idea/
+.vscode/
+
+# 测试与临时文件
+*.log
+.DS_Store
