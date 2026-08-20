@@ -1,0 +1,19 @@
+{
+  "enable": {
+    "description": "插件默认是否启用复读机模式（可在群内用 /复读机 开|关 单独控制每个群）",
+    "type": "bool",
+    "default": true
+  },
+  "threshold": {
+    "description": "触发复读所需的不同人数",
+    "type": "int",
+    "default": 3,
+    "hint": "群内连续 N 个不同的人发送相同消息时，机器人自动跟一条（2~50）"
+  },
+  "cooldown": {
+    "description": "触发复读后的冷却时间（秒）",
+    "type": "int",
+    "default": 0,
+    "hint": "每次触发后机器人冷却 N 秒再响应，0 表示无冷却"
+  }
+}
