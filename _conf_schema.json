@@ -4,6 +4,14 @@
     "type": "bool",
     "default": true
   },
+  "command_permission": {
+    "description": "群内复读机子指令的最低使用权限",
+    "type": "string",
+    "default": "bot_owner",
+    "options": ["member", "admin", "owner", "bot_owner"],
+    "labels": ["群成员", "群管理员", "群主", "BOT主人"],
+    "hint": "权限从低到高：群成员、群管理员、群主、BOT主人"
+  },
   "threshold": {
     "description": "触发复读所需的不同人数",
     "type": "int",

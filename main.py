@@ -8,11 +8,12 @@
 # 说明：核心逻辑在 process_message() 中，为纯同步函数，便于本地单元测试；
 #      事件监听 / 指令处理只是薄封装。持久化数据存放于 AstrBot 的 data 目录。
 
+import asyncio
 import json
 import os
 import re
-import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -32,6 +33,19 @@ def repeat_group():
 # 避免把指令消息误当成复读内容参与计数。
 _CMD_PATTERN = re.compile(r"^[/!]?复读机(?:\s|$)")
 
+_PERMISSION_RANK = {
+    "member": 0,
+    "admin": 1,
+    "owner": 2,
+    "bot_owner": 3,
+}
+_PERMISSION_LABEL = {
+    "member": "群成员",
+    "admin": "群管理员",
+    "owner": "群主",
+    "bot_owner": "BOT主人",
+}
+
 
 class _GroupState:
     """单个群的运行状态（含实时计数）"""
@@ -40,8 +54,10 @@ class _GroupState:
         "enabled",
         "threshold",
         "cooldown",
+        "lock",
         "current_text",
         "senders",
+        "repeated_in_segment",
         "last_repeat_time",
     )
 
@@ -49,9 +65,11 @@ class _GroupState:
         self.enabled = enabled
         self.threshold = threshold
         self.cooldown = cooldown
+        self.lock = asyncio.Lock()
         self.current_text: str | None = None  # 当前正在统计的消息指纹
         self.senders: set[str] = set()  # 已发送该消息的不同人（去重）
-        self.last_repeat_time: float = 0.0  # 上次触发复读的时间戳
+        self.repeated_in_segment = False  # 当前连续文本段是否已经成功复读
+        self.last_repeat_time: float | None = None  # 上次成功复读的单调时钟
 
 
 class RepeatPlugin(Star):
@@ -60,7 +78,6 @@ class RepeatPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
-        self._lock = threading.Lock()
         self._groups: dict[str, _GroupState] = {}
         self._state_file = self._data_dir() / "state.json"
         self._load_state()
@@ -76,30 +93,40 @@ class RepeatPlugin(Star):
 
         - 只统计【连续】发送的相同消息，内容一变就重新计数；
         - 同一个人的多次重复只算 1 人；
-        - 达到阈值并复读后重置计数，避免同一波刷屏被反复复读；
+        - 同一连续文本段成功复读一次后不再重复触发；
         - 支持冷却时间（seconds）。
+
+        调用方须持有该群的 ``state.lock``；返回文本仅代表一次发送候选，
+        发送成功后再由 ``_commit_repeat`` 提交复读状态。
         """
         state = self._get_group(group_id)
         text = (text or "").strip()
-        with self._lock:
-            if not state.enabled or not text:
-                return None
-            if text != state.current_text:
-                # 消息内容变了：重新开始计数
-                state.current_text = text
-                state.senders = {sender_id}
-                return None
-            state.senders.add(sender_id)
-            if len(state.senders) < state.threshold:
-                return None
-            # 达到阈值：检查冷却时间
-            if state.cooldown > 0 and now - state.last_repeat_time < state.cooldown:
-                return None
-            # 触发复读并重置计数
-            state.current_text = None
-            state.senders = set()
-            state.last_repeat_time = now
-            return text
+        if not state.enabled or not text:
+            return None
+        if text != state.current_text:
+            # 有效文本发生变化：开始新的连续文本段。
+            state.current_text = text
+            state.senders.clear()
+            state.repeated_in_segment = False
+        if (
+            state.last_repeat_time is not None
+            and state.cooldown > 0
+            and now - state.last_repeat_time < state.cooldown
+        ):
+            # 冷却期不累计发送者；文本切段已经在上方完成。
+            return None
+        if state.repeated_in_segment:
+            return None
+        state.senders.add(sender_id)
+        if len(state.senders) < state.threshold:
+            return None
+        return text
+
+    @staticmethod
+    def _commit_repeat(state: _GroupState, now: float) -> None:
+        state.repeated_in_segment = True
+        state.senders.clear()
+        state.last_repeat_time = now
 
     # ------------------------------------------------------------------
     # 事件监听：群消息
@@ -125,9 +152,21 @@ class RepeatPlugin(Star):
         # 忽略复读机指令本身
         if text.strip() and _CMD_PATTERN.match(text.strip()):
             return
-        reply_text = self.process_message(group_id, sender_id, text, time.time())
-        if reply_text is not None:
-            await event.send(MessageChain([Plain(reply_text)]))
+        state = self._get_group(group_id)
+        async with state.lock:
+            reply_text = self.process_message(
+                group_id, sender_id, text, time.monotonic()
+            )
+            if reply_text is None:
+                return
+            try:
+                await event.send(MessageChain([Plain(reply_text)]))
+            except Exception as e:
+                logger.warning(
+                    "发送复读消息失败（群 %s）: %s", group_id, e
+                )
+                return
+            self._commit_repeat(state, time.monotonic())
 
     # ------------------------------------------------------------------
     # 指令组：群内控制
@@ -138,12 +177,17 @@ class RepeatPlugin(Star):
         if not gid:
             yield event.plain_result("该指令仅支持在群聊中使用")
             return
+        permission_error = self._command_permission_error(event)
+        if permission_error:
+            yield event.plain_result(permission_error)
+            return
         state = self._get_group(gid)
-        with self._lock:
+        async with state.lock:
             state.enabled = True
-        self._save_state()
+            threshold = state.threshold
+            self._save_state()
         yield event.plain_result(
-            f"✅ 复读机模式已开启！群内连续 {state.threshold} 个不同的人"
+            f"✅ 复读机模式已开启！群内连续 {threshold} 个不同的人"
             "发送相同消息时，我会自动跟一条。"
         )
 
@@ -153,10 +197,14 @@ class RepeatPlugin(Star):
         if not gid:
             yield event.plain_result("该指令仅支持在群聊中使用")
             return
+        permission_error = self._command_permission_error(event)
+        if permission_error:
+            yield event.plain_result(permission_error)
+            return
         state = self._get_group(gid)
-        with self._lock:
+        async with state.lock:
             state.enabled = False
-        self._save_state()
+            self._save_state()
         yield event.plain_result("🛑 复读机模式已关闭")
 
     @repeat_group.command("阈值")
@@ -165,13 +213,17 @@ class RepeatPlugin(Star):
         if not gid:
             yield event.plain_result("该指令仅支持在群聊中使用")
             return
+        permission_error = self._command_permission_error(event)
+        if permission_error:
+            yield event.plain_result(permission_error)
+            return
         if num is None or not (2 <= num <= 50):
             yield event.plain_result("用法：/复读机 阈值 <人数>（2~50 的整数）")
             return
         state = self._get_group(gid)
-        with self._lock:
+        async with state.lock:
             state.threshold = num
-        self._save_state()
+            self._save_state()
         yield event.plain_result(
             f"🔢 已设置：连续 {num} 个不同的人发送相同消息后，我会跟一条"
         )
@@ -182,13 +234,17 @@ class RepeatPlugin(Star):
         if not gid:
             yield event.plain_result("该指令仅支持在群聊中使用")
             return
+        permission_error = self._command_permission_error(event)
+        if permission_error:
+            yield event.plain_result(permission_error)
+            return
         if num is None or not (0 <= num <= 3600):
             yield event.plain_result("用法：/复读机 冷却 <秒数>（0~3600，0 表示无冷却）")
             return
         state = self._get_group(gid)
-        with self._lock:
+        async with state.lock:
             state.cooldown = float(num)
-        self._save_state()
+            self._save_state()
         yield event.plain_result(
             f"⏱️ 已设置：触发复读后冷却 {num} 秒（0 表示无冷却）"
         )
@@ -199,13 +255,20 @@ class RepeatPlugin(Star):
         if not gid:
             yield event.plain_result("该指令仅支持在群聊中使用")
             return
+        permission_error = self._command_permission_error(event)
+        if permission_error:
+            yield event.plain_result(permission_error)
+            return
         state = self._get_group(gid)
-        status = "已开启" if state.enabled else "已关闭"
+        async with state.lock:
+            status = "已开启" if state.enabled else "已关闭"
+            threshold = state.threshold
+            cooldown = int(state.cooldown)
         yield event.plain_result(
             "📋 复读机状态\n"
             f"状态：{status}\n"
-            f"触发人数：{state.threshold} 人\n"
-            f"冷却时间：{int(state.cooldown)} 秒\n"
+            f"触发人数：{threshold} 人\n"
+            f"冷却时间：{cooldown} 秒\n"
             "——\n"
             "指令：/复读机 开 | 关 | 阈值 N | 冷却 N | 状态"
         )
@@ -216,19 +279,56 @@ class RepeatPlugin(Star):
     def _event_group_id(self, event: AstrMessageEvent) -> str:
         return str(getattr(event.message_obj, "group_id", "") or "")
 
+    def _read_command_permission(self) -> str:
+        permission = str(self.config.get("command_permission", "bot_owner"))
+        if permission in _PERMISSION_RANK:
+            return permission
+        logger.warning(
+            "无效的 command_permission 配置 %r，按 bot_owner 处理",
+            permission,
+        )
+        return "bot_owner"
+
+    def _command_permission_error(self, event: AstrMessageEvent) -> str | None:
+        required = self._read_command_permission()
+
+        is_admin = getattr(event, "is_admin", None)
+        try:
+            bot_owner = bool(is_admin() if callable(is_admin) else is_admin)
+        except Exception as e:
+            logger.warning("检查 BOT 主人权限失败: %s", e)
+            bot_owner = False
+
+        if bot_owner:
+            actual = "bot_owner"
+        else:
+            raw_message = self._value_of(event.message_obj, "raw_message")
+            sender = self._value_of(raw_message, "sender")
+            role = self._value_of(sender, "role")
+            actual = role if role in ("admin", "owner") else "member"
+
+        if _PERMISSION_RANK[actual] >= _PERMISSION_RANK[required]:
+            return None
+        return f"权限不足：该指令需要{_PERMISSION_LABEL[required]}权限"
+
+    @staticmethod
+    def _value_of(value, key: str):
+        if isinstance(value, Mapping):
+            return value.get(key)
+        return getattr(value, key, None)
+
     def _get_group(self, group_id: str) -> _GroupState:
         gid = str(group_id)
-        with self._lock:
-            state = self._groups.get(gid)
-            if state is None:
-                state = _GroupState(
-                    enabled=self._default_enabled(),
-                    threshold=self._default_threshold(),
-                    cooldown=self._default_cooldown(),
-                )
-                self._groups[gid] = state
-                self._save_state()
-            return state
+        state = self._groups.get(gid)
+        if state is None:
+            state = _GroupState(
+                enabled=self._default_enabled(),
+                threshold=self._default_threshold(),
+                cooldown=self._default_cooldown(),
+            )
+            self._groups[gid] = state
+            self._save_state()
+        return state
 
     def _default_enabled(self) -> bool:
         return bool(self.config.get("enable", True))
