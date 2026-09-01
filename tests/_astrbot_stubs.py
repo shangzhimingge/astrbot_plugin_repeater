@@ -54,6 +54,18 @@ class Plain:
         self.text = text
 
 
+class Face:
+    def __init__(self, id):
+        self.id = id
+
+
+class Image:
+    def __init__(self, file=None, url=None, path=None):
+        self.file = file
+        self.url = url
+        self.path = path
+
+
 class MessageChain(list):
     pass
 
@@ -80,6 +92,8 @@ def install():
     event.MessageChain = MessageChain
     event.filter = _Filter()
     components.Plain = Plain
+    components.Face = Face
+    components.Image = Image
     star.Context = object
     star.Star = Star
 

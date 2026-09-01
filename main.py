@@ -18,7 +18,7 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Face, Image, Plain
 from astrbot.api.star import Context, Star
 
 
@@ -55,7 +55,7 @@ class _GroupState:
         "threshold",
         "cooldown",
         "lock",
-        "current_text",
+        "current_fingerprint",
         "senders",
         "repeated_in_segment",
         "last_repeat_time",
@@ -66,9 +66,9 @@ class _GroupState:
         self.threshold = threshold
         self.cooldown = cooldown
         self.lock = asyncio.Lock()
-        self.current_text: str | None = None  # 当前正在统计的消息指纹
+        self.current_fingerprint: str | None = None  # 当前正在统计的消息指纹
         self.senders: set[str] = set()  # 已发送该消息的不同人（去重）
-        self.repeated_in_segment = False  # 当前连续文本段是否已经成功复读
+        self.repeated_in_segment = False  # 当前连续消息段是否已经成功复读
         self.last_repeat_time: float | None = None  # 上次成功复读的单调时钟
 
 
@@ -87,25 +87,25 @@ class RepeatPlugin(Star):
     # 核心逻辑（纯同步函数，便于本地测试）
     # ------------------------------------------------------------------
     def process_message(
-        self, group_id: str, sender_id: str, text: str, now: float
+        self, group_id: str, sender_id: str, fingerprint: str, now: float
     ) -> str | None:
-        """处理一条群消息，返回需要复读的文本；未达到条件时返回 None。
+        """处理一条群消息指纹，达到复读条件时返回该指纹。
 
         - 只统计【连续】发送的相同消息，内容一变就重新计数；
         - 同一个人的多次重复只算 1 人；
-        - 同一连续文本段成功复读一次后不再重复触发；
+        - 同一连续消息段成功复读一次后不再重复触发；
         - 支持冷却时间（seconds）。
 
-        调用方须持有该群的 ``state.lock``；返回文本仅代表一次发送候选，
+        调用方须持有该群的 ``state.lock``；返回指纹仅代表一次发送候选，
         发送成功后再由 ``_commit_repeat`` 提交复读状态。
         """
         state = self._get_group(group_id)
-        text = (text or "").strip()
-        if not state.enabled or not text:
+        fingerprint = (fingerprint or "").strip()
+        if not state.enabled or not fingerprint:
             return None
-        if text != state.current_text:
-            # 有效文本发生变化：开始新的连续文本段。
-            state.current_text = text
+        if fingerprint != state.current_fingerprint:
+            # 有效消息发生变化：开始新的连续消息段。
+            state.current_fingerprint = fingerprint
             state.senders.clear()
             state.repeated_in_segment = False
         if (
@@ -113,14 +113,46 @@ class RepeatPlugin(Star):
             and state.cooldown > 0
             and now - state.last_repeat_time < state.cooldown
         ):
-            # 冷却期不累计发送者；文本切段已经在上方完成。
+            # 冷却期不累计发送者；消息切段已经在上方完成。
             return None
         if state.repeated_in_segment:
             return None
         state.senders.add(sender_id)
         if len(state.senders) < state.threshold:
             return None
-        return text
+        return fingerprint
+
+    @staticmethod
+    def _extract_repeatable_component(event: AstrMessageEvent):
+        """提取唯一可复读组件，并返回其稳定指纹与原组件。"""
+        components = list(event.get_messages() or [])
+        if len(components) != 1:
+            return None
+
+        component = components[0]
+        if isinstance(component, Plain):
+            text = str(getattr(component, "text", "") or "").strip()
+            if not text:
+                return None
+            return f"text:{text}", component
+
+        if isinstance(component, Face):
+            face_id = getattr(component, "id", None)
+            if face_id is None or not str(face_id).strip():
+                return None
+            return f"face:{face_id}", component
+
+        if isinstance(component, Image):
+            image_id = (
+                getattr(component, "file", None)
+                or getattr(component, "url", None)
+                or getattr(component, "path", None)
+            )
+            if image_id is None or not str(image_id).strip():
+                return None
+            return f"image:{image_id}", component
+
+        return None
 
     @staticmethod
     def _commit_repeat(state: _GroupState, now: float) -> None:
@@ -152,15 +184,19 @@ class RepeatPlugin(Star):
         # 忽略复读机指令本身
         if text.strip() and _CMD_PATTERN.match(text.strip()):
             return
+        repeatable = self._extract_repeatable_component(event)
+        if repeatable is None:
+            return
+        fingerprint, component = repeatable
         state = self._get_group(group_id)
         async with state.lock:
-            reply_text = self.process_message(
-                group_id, sender_id, text, time.monotonic()
+            repeat_fingerprint = self.process_message(
+                group_id, sender_id, fingerprint, time.monotonic()
             )
-            if reply_text is None:
+            if repeat_fingerprint is None:
                 return
             try:
-                await event.send(MessageChain([Plain(reply_text)]))
+                await event.send(MessageChain([component]))
             except Exception as e:
                 logger.warning(
                     "发送复读消息失败（群 %s）: %s", group_id, e
