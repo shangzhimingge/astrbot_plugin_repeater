@@ -15,6 +15,7 @@ import re
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
@@ -32,6 +33,18 @@ def repeat_group():
 # 匹配指令调用本身（`/复读机 ...`、`!复读机 ...` 或 `复读机 ...`），
 # 避免把指令消息误当成复读内容参与计数。
 _CMD_PATTERN = re.compile(r"^[/!]?复读机(?:\s|$)")
+
+_CONTENT_HASH = re.compile(
+    r"(?i)(?<![0-9a-f])([0-9a-f]{64}|[0-9a-f]{32})(?![0-9a-f])"
+)
+_TERMINAL_CONTENT_HASH = re.compile(
+    r"(?i)([0-9a-f]{32})"
+    r"(?=(?:\.[a-z0-9]{1,10})?(?:$|[?#&]))"
+)
+_UUID_CONTENT_HASH = re.compile(
+    r"(?i)\{?([0-9a-f]{8})-([0-9a-f]{4})-([0-9a-f]{4})-"
+    r"([0-9a-f]{4})-([0-9a-f]{12})\}?"
+)
 
 _PERMISSION_RANK = {
     "member": 0,
@@ -122,9 +135,9 @@ class RepeatPlugin(Star):
             return None
         return fingerprint
 
-    @staticmethod
-    def _extract_repeatable_component(event: AstrMessageEvent):
-        """提取唯一可复读组件，并返回其稳定指纹与原组件。"""
+    @classmethod
+    def _extract_repeatable_component(cls, event: AstrMessageEvent):
+        """提取唯一可复读组件，并分离身份指纹与实际发送组件。"""
         components = list(event.get_messages() or [])
         if len(components) != 1:
             return None
@@ -143,16 +156,135 @@ class RepeatPlugin(Star):
             return f"face:{face_id}", component
 
         if isinstance(component, Image):
-            image_id = (
-                getattr(component, "file", None)
-                or getattr(component, "url", None)
-                or getattr(component, "path", None)
-            )
-            if image_id is None or not str(image_id).strip():
+            fingerprint = cls._image_fingerprint(event, component)
+            outbound = cls._rebuild_image_for_send(component)
+            if fingerprint is None or outbound is None:
                 return None
-            return f"image:{image_id}", component
+            return fingerprint, outbound
 
         return None
+
+    @classmethod
+    def _image_fingerprint(cls, event: AstrMessageEvent, component: Image):
+        file_unique = cls._raw_image_file_unique(event)
+        if file_unique is None:
+            file_unique = getattr(component, "file_unique", None)
+        if file_unique is not None and str(file_unique).strip():
+            return f"image:unique:{str(file_unique).strip().lower()}"
+
+        values = [
+            getattr(component, "file", None),
+            getattr(component, "url", None),
+            getattr(component, "path", None),
+        ]
+        hash_values = (
+            values[0],
+            cls._normalize_image_value(values[1]),
+            values[2],
+        )
+        for value in hash_values:
+            digest = cls._content_hash(value)
+            if digest is not None:
+                return f"image:hash:{digest}"
+
+        # 没有内容哈希时，URL（去掉易失 rkey）比消息级 file token 更稳定。
+        for value in (values[1], values[2], values[0]):
+            normalized = cls._normalize_image_value(value)
+            if normalized:
+                return f"image:value:{normalized}"
+        return None
+
+    @classmethod
+    def _raw_image_file_unique(cls, event: AstrMessageEvent):
+        message_obj = getattr(event, "message_obj", None)
+        raw_message = cls._value_of(message_obj, "raw_message")
+        segments = cls._value_of(raw_message, "message")
+        if not isinstance(segments, (list, tuple)):
+            return None
+        for segment in segments:
+            segment_type = cls._value_of(segment, "type")
+            if str(segment_type or "").lower() != "image":
+                continue
+            data = cls._value_of(segment, "data")
+            file_unique = cls._value_of(data, "file_unique")
+            if file_unique is not None and str(file_unique).strip():
+                return file_unique
+        return None
+
+    @staticmethod
+    def _content_hash(value) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        match = _CONTENT_HASH.search(text)
+        if match:
+            return match.group(1).lower()
+        match = _TERMINAL_CONTENT_HASH.search(text)
+        if match:
+            return match.group(1).lower()
+        match = _UUID_CONTENT_HASH.search(text)
+        if match:
+            return "".join(match.groups()).lower()
+        return None
+
+    @staticmethod
+    def _normalize_image_value(value) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if not text:
+            return ""
+        if text.lower().startswith(("http://", "https://")):
+            parts = urlsplit(text)
+            query = urlencode(
+                [
+                    (key, item)
+                    for key, item in parse_qsl(
+                        parts.query, keep_blank_values=True
+                    )
+                    if key.lower() != "rkey"
+                ],
+                doseq=True,
+            )
+            return urlunsplit(
+                (
+                    parts.scheme.lower(),
+                    parts.netloc.lower(),
+                    parts.path,
+                    query,
+                    parts.fragment,
+                )
+            )
+        return text
+
+    @staticmethod
+    def _rebuild_image_for_send(component: Image):
+        url = str(getattr(component, "url", None) or "").strip()
+        path = str(getattr(component, "path", None) or "").strip()
+        file = str(getattr(component, "file", None) or "").strip()
+        source = url or path or file
+        if not source:
+            return None
+
+        if source.lower().startswith(("http://", "https://")):
+            from_url = getattr(Image, "fromURL", None)
+            if callable(from_url):
+                return from_url(source)
+            return Image(file=source)
+
+        is_local_path = bool(path) or source.startswith(("/", "\\"))
+        is_local_path = is_local_path or bool(
+            re.match(r"^[a-zA-Z]:[\\/]", source)
+        )
+        if is_local_path:
+            from_file_system = getattr(Image, "fromFileSystem", None)
+            if callable(from_file_system):
+                return from_file_system(source)
+            return Image(file=source, path=source)
+
+        return Image(file=source)
 
     @staticmethod
     def _commit_repeat(state: _GroupState, now: float) -> None:

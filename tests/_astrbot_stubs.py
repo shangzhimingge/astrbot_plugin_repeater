@@ -60,10 +60,30 @@ class Face:
 
 
 class Image:
-    def __init__(self, file=None, url=None, path=None):
+    def __init__(self, file=None, url=None, path=None, file_unique=None):
         self.file = file
         self.url = url
         self.path = path
+        self.file_unique = file_unique
+        self.constructed_by = "direct"
+        self.converted_source = None
+
+    @classmethod
+    def fromURL(cls, url):
+        image = cls(file=url, url=url)
+        image.constructed_by = "url"
+        return image
+
+    @classmethod
+    def fromFileSystem(cls, path):
+        image = cls(file=path, path=path)
+        image.constructed_by = "path"
+        return image
+
+    def convert_to_base64(self):
+        """Record the source the aiocqhttp adapter would try to convert."""
+        self.converted_source = self.url or self.path or self.file
+        return self.converted_source
 
 
 class MessageChain(list):

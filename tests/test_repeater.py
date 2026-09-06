@@ -26,11 +26,20 @@ class _FakeTime:
 
 
 class FakeEvent:
-    def __init__(self, group_id, sender_id, text, send_hook=None, messages=None):
+    def __init__(
+        self,
+        group_id,
+        sender_id,
+        text,
+        send_hook=None,
+        messages=None,
+        raw_message=None,
+    ):
         self.message_obj = SimpleNamespace(
             group_id=group_id,
             self_id="bot",
             sender=SimpleNamespace(user_id=sender_id),
+            raw_message=raw_message,
         )
         self.message_str = text
         self._messages = list(messages if messages is not None else [Plain(text)])
@@ -43,6 +52,8 @@ class FakeEvent:
     async def send(self, chain):
         if self._send_hook:
             await self._send_hook()
+        if isinstance(chain[0], Image):
+            chain[0].convert_to_base64()
         self.sent.append(chain[0])
 
     def plain_result(self, text):
@@ -58,9 +69,18 @@ def make_plugin(*, threshold=2, cooldown=0):
 
 
 async def deliver(
-    plugin, group_id, sender_id, text, now, send_hook=None, messages=None
+    plugin,
+    group_id,
+    sender_id,
+    text,
+    now,
+    send_hook=None,
+    messages=None,
+    raw_message=None,
 ):
-    event = FakeEvent(group_id, sender_id, text, send_hook, messages)
+    event = FakeEvent(
+        group_id, sender_id, text, send_hook, messages, raw_message
+    )
     token = _NOW.set(now)
     try:
         await plugin.on_group_message(event)
@@ -219,26 +239,180 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trigger.sent, [triggering_face])
         self.assertIs(trigger.sent[0], triggering_face)
 
-    async def test_image_uses_file_url_or_path_fingerprint_and_is_sent_unchanged(self):
-        cases = (
-            (Image(file="file-id"), Image(file="file-id")),
-            (
-                Image(url="https://example.test/a.png"),
-                Image(url="https://example.test/a.png"),
-            ),
-            (Image(path="/tmp/a.png"), Image(path="/tmp/a.png")),
+    async def test_plain_is_sent_unchanged(self):
+        plugin = make_plugin()
+        first = Plain("A")
+        triggering = Plain("A")
+
+        await deliver(plugin, "g", "u1", "A", 1, messages=[first])
+        event = await deliver(
+            plugin, "g", "u2", "A", 2, messages=[triggering]
         )
 
-        for first_image, triggering_image in cases:
-            with self.subTest(image=vars(first_image)):
+        self.assertEqual(event.sent, [triggering])
+        self.assertIs(event.sent[0], triggering)
+
+    async def test_raw_file_unique_stabilizes_message_level_file_tokens(self):
+        plugin = make_plugin()
+        unique = "0123456789abcdef0123456789abcdef"
+        raw = {
+            "message": [
+                {"type": "image", "data": {"file_unique": unique}}
+            ]
+        }
+        first = Image(
+            file="message-token-one",
+            url="https://example.test/a.png?rkey=one&fileid=42",
+        )
+        triggering = Image(
+            file="message-token-two",
+            url="https://example.test/a.png?rkey=two&fileid=42",
+        )
+
+        await deliver(
+            plugin, "g", "u1", "", 1, messages=[first], raw_message=raw
+        )
+        trigger = await deliver(
+            plugin,
+            "g",
+            "u2",
+            "",
+            2,
+            messages=[triggering],
+            raw_message=raw,
+        )
+
+        self.assertEqual(len(trigger.sent), 1)
+        output = trigger.sent[0]
+        self.assertIsNot(output, triggering)
+        self.assertEqual(output.constructed_by, "url")
+        self.assertEqual(output.converted_source, triggering.url)
+
+    async def test_long_tokens_with_same_trailing_hash_are_the_same_image(self):
+        plugin = make_plugin()
+        digest = "0123456789abcdef0123456789abcdef"
+        first = Image(
+            file=f"opaque-message-token-one/{digest}.jpg",
+            url="https://example.test/one",
+        )
+        triggering = Image(
+            file=f"opaque-message-token-two/{digest}.jpg",
+            url="https://example.test/two",
+        )
+
+        await deliver(plugin, "g", "u1", "", 1, messages=[first])
+        trigger = await deliver(
+            plugin, "g", "u2", "", 2, messages=[triggering]
+        )
+
+        self.assertEqual(len(trigger.sent), 1)
+
+    async def test_hash_filename_supports_modern_md5_and_sha256(self):
+        digests = (
+            "F5EF2DCCB5E7A9A24A1B932F13BD2C08",
+            "0123456789ABCDEF" * 4,
+        )
+        for digest in digests:
+            with self.subTest(length=len(digest)):
                 plugin = make_plugin()
-                await deliver(plugin, "g", "u1", "", 1, messages=[first_image])
+                first = Image(file=f"token-a/{digest}.jpg")
+                triggering = Image(file=f"token-b/{digest.lower()}.jpg")
+
+                await deliver(plugin, "g", "u1", "", 1, messages=[first])
                 trigger = await deliver(
-                    plugin, "g", "u2", "", 2, messages=[triggering_image]
+                    plugin, "g", "u2", "", 2, messages=[triggering]
                 )
 
-                self.assertEqual(trigger.sent, [triggering_image])
-                self.assertIs(trigger.sent[0], triggering_image)
+                self.assertEqual(len(trigger.sent), 1)
+
+    async def test_image_send_rebuilds_with_url_path_then_file_priority(self):
+        cases = (
+            (
+                Image(
+                    file="message-token",
+                    url="https://example.test/a.png",
+                    path="/tmp/not-selected.png",
+                ),
+                "url",
+                "https://example.test/a.png",
+            ),
+            (Image(file="message-token", path="/tmp/a.png"), "path", "/tmp/a.png"),
+            (
+                Image(file="https://example.test/from-file.png"),
+                "url",
+                "https://example.test/from-file.png",
+            ),
+            (Image(file="/tmp/from-file.png"), "path", "/tmp/from-file.png"),
+        )
+
+        for triggering, expected_constructor, expected_source in cases:
+            with self.subTest(image=vars(triggering)):
+                plugin = make_plugin()
+                first = Image(
+                    file=triggering.file,
+                    url=triggering.url,
+                    path=triggering.path,
+                )
+                await deliver(plugin, "g", "u1", "", 1, messages=[first])
+                event = await deliver(
+                    plugin, "g", "u2", "", 2, messages=[triggering]
+                )
+
+                self.assertEqual(len(event.sent), 1)
+                output = event.sent[0]
+                self.assertIsNot(output, triggering)
+                self.assertEqual(output.constructed_by, expected_constructor)
+                self.assertEqual(output.converted_source, expected_source)
+                self.assertTrue(output.file)
+
+    async def test_url_ignores_only_rkey_and_preserves_image_query_identity(self):
+        plugin = make_plugin()
+        first = Image(
+            file="message-token-one",
+            url=(
+                "https://example.test/download?appid=1407&fileid=one&"
+                f"rkey={'1' * 32}"
+            ),
+        )
+        triggering = Image(
+            file="message-token-two",
+            url=(
+                "https://example.test/download?appid=1407&fileid=one&"
+                f"rkey={'2' * 32}"
+            ),
+        )
+        different = Image(
+            file="message-token-three",
+            url=(
+                "https://example.test/download?appid=1407&fileid=two&"
+                f"rkey={'2' * 32}"
+            ),
+        )
+
+        await deliver(plugin, "g", "u1", "", 1, messages=[first])
+        trigger = await deliver(
+            plugin, "g", "u2", "", 2, messages=[triggering]
+        )
+        different_event = await deliver(
+            plugin, "g", "u1", "", 3, messages=[different]
+        )
+        second_fileid_trigger = await deliver(
+            plugin,
+            "g",
+            "u2",
+            "",
+            4,
+            messages=[
+                Image(
+                    file="message-token-four",
+                    url=different.url.replace("2" * 32, "3" * 32),
+                )
+            ],
+        )
+
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertEqual(different_event.sent, [])
+        self.assertEqual(len(second_fileid_trigger.sent), 1)
 
     async def test_component_change_starts_a_new_segment(self):
         plugin = make_plugin()
@@ -308,7 +482,12 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(failed.sent, [])
-                self.assertEqual(retried.sent, [retry_component])
+                self.assertEqual(len(retried.sent), 1)
+                if isinstance(retry_component, Image):
+                    self.assertIsNot(retried.sent[0], retry_component)
+                    self.assertTrue(retried.sent[0].converted_source)
+                else:
+                    self.assertIs(retried.sent[0], retry_component)
 
     async def test_component_senders_do_not_accumulate_during_cooldown(self):
         plugin = make_plugin(cooldown=10)
