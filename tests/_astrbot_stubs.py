@@ -9,12 +9,16 @@ import types
 class _Logger:
     def __init__(self):
         self.warnings: list[tuple[object, ...]] = []
+        self.debugs: list[tuple[object, ...]] = []
 
     def info(self, *args, **kwargs):
         pass
 
     def warning(self, *args, **kwargs):
         self.warnings.append(args)
+
+    def debug(self, *args, **kwargs):
+        self.debugs.append(args)
 
 
 class _CommandGroup:
@@ -59,14 +63,33 @@ class Face:
         self.id = id
 
 
+class At:
+    def __init__(self, qq):
+        self.qq = qq
+
+
+class Reply:
+    def __init__(self, id):
+        self.id = id
+
+
 class Image:
-    def __init__(self, file=None, url=None, path=None, file_unique=None):
+    def __init__(
+        self,
+        file=None,
+        url=None,
+        path=None,
+        file_unique=None,
+        base64_data=None,
+    ):
         self.file = file
         self.url = url
         self.path = path
         self.file_unique = file_unique
+        self.base64_data = base64_data
         self.constructed_by = "direct"
         self.converted_source = None
+        self.convert_calls = 0
 
     @classmethod
     def fromURL(cls, url):
@@ -80,10 +103,17 @@ class Image:
         image.constructed_by = "path"
         return image
 
-    def convert_to_base64(self):
+    @classmethod
+    def fromBase64(cls, base64_data):
+        image = cls(file=f"base64://{base64_data}", base64_data=base64_data)
+        image.constructed_by = "base64"
+        return image
+
+    async def convert_to_base64(self):
         """Record the source the aiocqhttp adapter would try to convert."""
-        self.converted_source = self.url or self.path or self.file
-        return self.converted_source
+        self.convert_calls += 1
+        self.converted_source = self.url or self.file
+        return self.base64_data or self.converted_source
 
 
 class MessageChain(list):
@@ -113,6 +143,8 @@ def install():
     event.filter = _Filter()
     components.Plain = Plain
     components.Face = Face
+    components.At = At
+    components.Reply = Reply
     components.Image = Image
     star.Context = object
     star.Star = Star

@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import unittest
+from collections import OrderedDict
 from types import SimpleNamespace
 
-from tests._astrbot_stubs import Face, Image, Plain, install
+from tests._astrbot_stubs import At, Face, Image, Plain, Reply, install
 
 LOGGER = install()
 
@@ -34,6 +35,7 @@ class FakeEvent:
         send_hook=None,
         messages=None,
         raw_message=None,
+        bot=None,
     ):
         self.message_obj = SimpleNamespace(
             group_id=group_id,
@@ -45,6 +47,7 @@ class FakeEvent:
         self._messages = list(messages if messages is not None else [Plain(text)])
         self.sent = []
         self._send_hook = send_hook
+        self.bot = bot
 
     def get_messages(self):
         return self._messages
@@ -53,7 +56,7 @@ class FakeEvent:
         if self._send_hook:
             await self._send_hook()
         if isinstance(chain[0], Image):
-            chain[0].convert_to_base64()
+            await chain[0].convert_to_base64()
         self.sent.append(chain[0])
 
     def plain_result(self, text):
@@ -64,6 +67,7 @@ def make_plugin(*, threshold=2, cooldown=0):
     plugin = object.__new__(main.RepeatPlugin)
     plugin.config = {"enable": True, "threshold": threshold, "cooldown": cooldown}
     plugin._groups = {}
+    plugin._media_digest_cache = OrderedDict()
     plugin._save_state = lambda: None
     return plugin
 
@@ -77,9 +81,10 @@ async def deliver(
     send_hook=None,
     messages=None,
     raw_message=None,
+    bot=None,
 ):
     event = FakeEvent(
-        group_id, sender_id, text, send_hook, messages, raw_message
+        group_id, sender_id, text, send_hook, messages, raw_message, bot
     )
     token = _NOW.set(now)
     try:
@@ -87,6 +92,38 @@ async def deliver(
     finally:
         _NOW.reset(token)
     return event
+
+
+def raw_segment(segment_type, **data):
+    return {"type": segment_type, "data": data}
+
+
+def raw_event(*segments, self_id="bot"):
+    return {"self_id": self_id, "message": list(segments)}
+
+
+class FakeDirectBot:
+    def __init__(self, failures=0):
+        self.failures = failures
+        self.send_group_calls = []
+        self.action_calls = []
+
+    async def send_group_msg(self, **payload):
+        self.send_group_calls.append(payload)
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("mface send failed")
+
+    async def call_action(self, action, **payload):
+        self.action_calls.append((action, payload))
+
+
+class FakeActionBot:
+    def __init__(self):
+        self.action_calls = []
+
+    async def call_action(self, action, **payload):
+        self.action_calls.append((action, payload))
 
 
 def sent_values(*events):
@@ -326,6 +363,7 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(trigger.sent), 1)
 
     async def test_image_send_rebuilds_with_url_path_then_file_priority(self):
+        digest = "0123456789abcdef0123456789abcdef"
         cases = (
             (
                 Image(
@@ -336,13 +374,24 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 "url",
                 "https://example.test/a.png",
             ),
-            (Image(file="message-token", path="/tmp/a.png"), "path", "/tmp/a.png"),
+            (
+                Image(
+                    file="message-token",
+                    path=f"/tmp/{digest}.png",
+                ),
+                "path",
+                f"/tmp/{digest}.png",
+            ),
             (
                 Image(file="https://example.test/from-file.png"),
                 "url",
                 "https://example.test/from-file.png",
             ),
-            (Image(file="/tmp/from-file.png"), "path", "/tmp/from-file.png"),
+            (
+                Image(file=f"/tmp/{digest}.png"),
+                "path",
+                f"/tmp/{digest}.png",
+            ),
         )
 
         for triggering, expected_constructor, expected_source in cases:
@@ -428,7 +477,7 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             sent_values(*events),
-            [("face", 1), ("image", "x", None, None)],
+            [("face", 1), ("image", "base64://x", None, None)],
         )
 
     async def test_mixed_or_multi_component_message_is_ignored_without_cutting_segment(self):
@@ -508,7 +557,7 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             sent_values(first, during_one, during_two, after_one, after_two),
-            [("face", 1), ("image", "x", None, None)],
+            [("face", 1), ("image", "base64://x", None, None)],
         )
 
     async def test_unicode_emoji_remains_a_plain_message(self):
@@ -517,6 +566,386 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
         trigger = await deliver(plugin, "g", "u2", "😀", 2)
 
         self.assertEqual(sent_values(trigger), ["😀"])
+
+
+class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.real_time = main.time
+        main.time = _FakeTime
+        LOGGER.debugs.clear()
+
+    async def asyncTearDown(self):
+        main.time = self.real_time
+
+    async def test_raw_image_repeats_when_parsed_chain_is_empty(self):
+        cases = (
+            raw_event(
+                raw_segment(
+                    "image",
+                    file="message-token",
+                    url="https://example.test/raw.png",
+                    file_unique="abc123",
+                )
+            ),
+            SimpleNamespace(
+                self_id="bot",
+                message=[
+                    SimpleNamespace(
+                        type="image",
+                        data=SimpleNamespace(
+                            file="message-token",
+                            url="https://example.test/raw.png",
+                            file_unique="abc123",
+                        ),
+                    )
+                ],
+            ),
+        )
+        for raw in cases:
+            with self.subTest(raw_type=type(raw).__name__):
+                plugin = make_plugin()
+                await deliver(
+                    plugin, "g", "u1", "", 1, messages=[], raw_message=raw
+                )
+                trigger = await deliver(
+                    plugin, "g", "u2", "", 2, messages=[], raw_message=raw
+                )
+
+                self.assertEqual(len(trigger.sent), 1)
+                self.assertEqual(trigger.sent[0].constructed_by, "url")
+
+    async def test_raw_image_allows_only_blank_text_reply_and_self_at_helpers(self):
+        raw = raw_event(
+            raw_segment("reply", id="100"),
+            raw_segment("text", text=" \n"),
+            raw_segment("at", qq="bot"),
+            raw_segment(
+                "image",
+                file="opaque",
+                url="https://example.test/helper.png",
+                file_unique="helper-image",
+            ),
+        )
+        parsed = [Reply("100"), Plain(" \n"), At("bot")]
+        plugin = make_plugin()
+
+        await deliver(
+            plugin, "g", "u1", "", 1, messages=parsed, raw_message=raw
+        )
+        trigger = await deliver(
+            plugin, "g", "u2", "", 2, messages=parsed, raw_message=raw
+        )
+
+        self.assertEqual(len(trigger.sent), 1)
+
+    async def test_raw_media_rejects_caption_other_at_and_multiple_media(self):
+        invalid_raw_messages = (
+            raw_event(
+                raw_segment("image", file="a", url="https://e.test/a.png"),
+                raw_segment("text", text="caption-secret"),
+            ),
+            raw_event(
+                raw_segment("image", file="a", url="https://e.test/a.png"),
+                raw_segment("at", qq="someone-else"),
+            ),
+            raw_event(
+                raw_segment("image", file="a", url="https://e.test/a.png"),
+                raw_segment("mface", emoji_package_id="1", emoji_id="2"),
+            ),
+        )
+        for raw in invalid_raw_messages:
+            with self.subTest(raw=raw):
+                plugin = make_plugin()
+                event = await deliver(
+                    plugin, "g", "u1", "", 1, messages=[], raw_message=raw
+                )
+                self.assertEqual(event.sent, [])
+                self.assertEqual(plugin._groups, {})
+
+    async def test_market_image_and_legacy_mface_share_package_emoji_identity(self):
+        plugin = make_plugin()
+        market_image = raw_event(
+            raw_segment(
+                "image",
+                file="market-token-one",
+                url="https://example.test/market.gif?rkey=one",
+                emoji_package_id="88",
+                emoji_id="99",
+                key="rotating-key-one",
+                summary="[商城表情]",
+            )
+        )
+        legacy_mface = raw_event(
+            raw_segment(
+                "mface",
+                emoji_package_id="88",
+                emoji_id="99",
+                key="rotating-key-two",
+                summary="[商城表情]",
+            )
+        )
+        bot = FakeDirectBot()
+
+        await deliver(
+            plugin,
+            "g",
+            "u1",
+            "",
+            1,
+            messages=[Image(file="market-token-one")],
+            raw_message=market_image,
+            bot=bot,
+        )
+        trigger = await deliver(
+            plugin,
+            "g",
+            "u2",
+            "",
+            2,
+            messages=[],
+            raw_message=legacy_mface,
+            bot=bot,
+        )
+
+        self.assertEqual(trigger.sent, [])
+        self.assertEqual(len(bot.send_group_calls), 1)
+
+    async def test_legacy_mface_uses_whitelisted_direct_payload_then_call_action(self):
+        raw = raw_event(
+            raw_segment(
+                "mface",
+                emoji_package_id="10",
+                emoji_id="20",
+                key="private-key",
+                summary="[动画表情]",
+                url="https://example.test/fallback.gif?secret=yes",
+                ignored="do-not-forward",
+            )
+        )
+        bots = (FakeDirectBot(), FakeActionBot())
+        for bot in bots:
+            with self.subTest(bot=type(bot).__name__):
+                plugin = make_plugin()
+                await deliver(
+                    plugin,
+                    "g",
+                    "u1",
+                    "",
+                    1,
+                    messages=[],
+                    raw_message=raw,
+                    bot=bot,
+                )
+                await deliver(
+                    plugin,
+                    "g",
+                    "u2",
+                    "",
+                    2,
+                    messages=[],
+                    raw_message=raw,
+                    bot=bot,
+                )
+
+                if isinstance(bot, FakeDirectBot):
+                    self.assertEqual(len(bot.send_group_calls), 1)
+                    payload = bot.send_group_calls[0]
+                    self.assertEqual(bot.action_calls, [])
+                else:
+                    self.assertEqual(len(bot.action_calls), 1)
+                    action, payload = bot.action_calls[0]
+                    self.assertEqual(action, "send_group_msg")
+                self.assertEqual(payload["group_id"], "g")
+                self.assertEqual(payload["self_id"], "bot")
+                self.assertEqual(payload["message"][0]["type"], "mface")
+                self.assertEqual(
+                    set(payload["message"][0]["data"]),
+                    {"emoji_package_id", "emoji_id", "key", "summary"},
+                )
+
+    async def test_legacy_mface_without_direct_api_uses_gif_image(self):
+        raw = raw_event(
+            raw_segment(
+                "mface",
+                emoji_package_id="10",
+                emoji_id="20",
+                key="private-key",
+                url="https://example.test/fallback.gif",
+            )
+        )
+        plugin = make_plugin()
+
+        await deliver(
+            plugin,
+            "g",
+            "u1",
+            "",
+            1,
+            messages=[],
+            raw_message=raw,
+            bot=object(),
+        )
+        trigger = await deliver(
+            plugin,
+            "g",
+            "u2",
+            "",
+            2,
+            messages=[],
+            raw_message=raw,
+            bot=object(),
+        )
+
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertEqual(trigger.sent[0].constructed_by, "url")
+
+    async def test_mface_failed_send_retries_then_repeats_once_in_segment(self):
+        raw = raw_event(
+            raw_segment(
+                "mface",
+                emoji_package_id="10",
+                emoji_id="20",
+                key="private-key",
+            )
+        )
+        plugin = make_plugin()
+        bot = FakeDirectBot(failures=1)
+
+        await deliver(
+            plugin, "g", "u1", "", 1, messages=[], raw_message=raw, bot=bot
+        )
+        await deliver(
+            plugin, "g", "u2", "", 2, messages=[], raw_message=raw, bot=bot
+        )
+        await deliver(
+            plugin, "g", "u3", "", 3, messages=[], raw_message=raw, bot=bot
+        )
+        await deliver(
+            plugin, "g", "u4", "", 4, messages=[], raw_message=raw, bot=bot
+        )
+
+        self.assertEqual(len(bot.send_group_calls), 2)
+        self.assertEqual(bot.action_calls, [])
+        self.assertIn("g", plugin._groups)
+        self.assertTrue(plugin._groups["g"].repeated_in_segment)
+
+    async def test_opaque_images_use_base64_content_digest(self):
+        plugin = make_plugin()
+        first = Image(file="opaque-token-one", base64_data="same-content")
+        triggering = Image(file="opaque-token-two", base64_data="same-content")
+
+        await deliver(plugin, "g", "u1", "", 1, messages=[first])
+        trigger = await deliver(
+            plugin, "g", "u2", "", 2, messages=[triggering]
+        )
+
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertEqual(trigger.sent[0].constructed_by, "base64")
+
+        other = make_plugin()
+        different_one = Image(file="opaque-a", base64_data="content-a")
+        different_two = Image(file="opaque-b", base64_data="content-b")
+        await deliver(other, "g", "u1", "", 1, messages=[different_one])
+        no_trigger = await deliver(
+            other, "g", "u2", "", 2, messages=[different_two]
+        )
+        self.assertEqual(no_trigger.sent, [])
+        self.assertNotEqual(
+            other._groups["g"].current_fingerprint,
+            "image:value:opaque-b",
+        )
+
+    async def test_weak_path_is_rebuilt_before_content_digest(self):
+        plugin = make_plugin()
+        first = Image(file="message-token-one", path="/tmp/no-hash.png")
+        triggering = Image(
+            file="message-token-two", path="/tmp/no-hash.png"
+        )
+
+        await deliver(plugin, "g", "u1", "", 1, messages=[first])
+        trigger = await deliver(
+            plugin, "g", "u2", "", 2, messages=[triggering]
+        )
+
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertEqual(trigger.sent[0].constructed_by, "base64")
+        self.assertEqual(trigger.sent[0].file, "base64:///tmp/no-hash.png")
+
+    async def test_media_digest_cache_is_bounded_and_expires(self):
+        plugin = make_plugin(threshold=50)
+        first = Image(file="opaque-cache", base64_data="cache-content")
+        cached = Image(file="opaque-cache", base64_data="cache-content")
+        expired = Image(file="opaque-cache", base64_data="cache-content")
+
+        await deliver(plugin, "g", "u1", "", 0, messages=[first])
+        await deliver(plugin, "g", "u2", "", 1, messages=[cached])
+        await deliver(plugin, "g", "u3", "", 301, messages=[expired])
+
+        self.assertEqual(first.convert_calls, 1)
+        self.assertEqual(cached.convert_calls, 0)
+        self.assertEqual(expired.convert_calls, 1)
+
+        bounded = make_plugin(threshold=50)
+        for index in range(130):
+            await deliver(
+                bounded,
+                "g",
+                f"u{index}",
+                "",
+                index,
+                messages=[
+                    Image(
+                        file=f"opaque-{index}",
+                        base64_data=f"content-{index}",
+                    )
+                ],
+            )
+        self.assertLessEqual(len(bounded._media_digest_cache), 128)
+
+    async def test_url_query_order_and_rkey_do_not_change_identity(self):
+        plugin = make_plugin()
+        first = Image(
+            file="opaque-one",
+            url="https://e.test/d?appid=1&fileid=2&rkey=secret-one",
+        )
+        second = Image(
+            file="opaque-two",
+            url="https://e.test/d?rkey=secret-two&fileid=2&appid=1",
+        )
+
+        await deliver(plugin, "g", "u1", "", 1, messages=[first])
+        trigger = await deliver(plugin, "g", "u2", "", 2, messages=[second])
+
+        self.assertEqual(len(trigger.sent), 1)
+
+    async def test_media_debug_diagnostics_are_redacted(self):
+        raw = raw_event(
+            raw_segment(
+                "image",
+                file="complete-private-token",
+                url="https://example.test/private.gif?rkey=private-rkey",
+                file_unique="private-file-unique",
+                key="private-market-key",
+            )
+        )
+        plugin = make_plugin()
+
+        await deliver(
+            plugin, "g", "u1", "private-body", 1, messages=[], raw_message=raw
+        )
+
+        rendered = []
+        for args in LOGGER.debugs:
+            rendered.append(str(args[0]) % tuple(args[1:]))
+        diagnostics = "\n".join(rendered)
+        self.assertIn("[repeater.media]", diagnostics)
+        self.assertIn("source=raw", diagnostics)
+        self.assertNotIn("complete-private-token", diagnostics)
+        self.assertNotIn("https://example.test", diagnostics)
+        self.assertNotIn("private-rkey", diagnostics)
+        self.assertNotIn("private-file-unique", diagnostics)
+        self.assertNotIn("private-market-key", diagnostics)
+        self.assertNotIn("private-body", diagnostics)
 
 
 if __name__ == "__main__":

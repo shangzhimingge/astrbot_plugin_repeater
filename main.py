@@ -9,11 +9,14 @@
 #      事件监听 / 指令处理只是薄封装。持久化数据存放于 AstrBot 的 data 目录。
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -34,11 +37,8 @@ def repeat_group():
 # 避免把指令消息误当成复读内容参与计数。
 _CMD_PATTERN = re.compile(r"^[/!]?复读机(?:\s|$)")
 
-_CONTENT_HASH = re.compile(
-    r"(?i)(?<![0-9a-f])([0-9a-f]{64}|[0-9a-f]{32})(?![0-9a-f])"
-)
 _TERMINAL_CONTENT_HASH = re.compile(
-    r"(?i)([0-9a-f]{32})"
+    r"(?i)(?<![0-9a-f])([0-9a-f]{64}|[0-9a-f]{32})"
     r"(?=(?:\.[a-z0-9]{1,10})?(?:$|[?#&]))"
 )
 _UUID_CONTENT_HASH = re.compile(
@@ -58,6 +58,23 @@ _PERMISSION_LABEL = {
     "owner": "群主",
     "bot_owner": "BOT主人",
 }
+
+_MEDIA_CACHE_LIMIT = 128
+_MEDIA_CACHE_TTL = 300.0
+
+
+@dataclass(slots=True)
+class _RepeatCandidate:
+    kind: str
+    source: str
+    component: object | None = None
+    data: object | None = None
+    fingerprint: str | None = None
+    strategy: str = "pending"
+    channel: str = "event"
+    outbound: object | None = None
+    probe: object | None = None
+    content_base64: str | None = None
 
 
 class _GroupState:
@@ -92,6 +109,9 @@ class RepeatPlugin(Star):
         super().__init__(context)
         self.config = config
         self._groups: dict[str, _GroupState] = {}
+        self._media_digest_cache: OrderedDict[
+            str, tuple[float, str]
+        ] = OrderedDict()
         self._state_file = self._data_dir() / "state.json"
         self._load_state()
         logger.info("复读机插件已加载，群状态数据文件: %s", self._state_file)
@@ -136,118 +156,280 @@ class RepeatPlugin(Star):
         return fingerprint
 
     @classmethod
-    def _extract_repeatable_component(cls, event: AstrMessageEvent):
-        """提取唯一可复读组件，并分离身份指纹与实际发送组件。"""
+    def _extract_candidate(cls, event: AstrMessageEvent):
+        """Raw OneBot 媒体优先；没有 raw 媒体时才回退解析后组件。"""
+        found_raw_media, candidate = cls._raw_media_candidate(event)
+        if found_raw_media:
+            return candidate
+
         components = list(event.get_messages() or [])
         if len(components) != 1:
             return None
-
         component = components[0]
         if isinstance(component, Plain):
-            text = str(getattr(component, "text", "") or "").strip()
+            text = cls._clean_value(getattr(component, "text", None))
             if not text:
                 return None
-            return f"text:{text}", component
-
+            return _RepeatCandidate(
+                kind="text",
+                source="parsed",
+                component=component,
+                fingerprint=f"text:{text}",
+                strategy="plain",
+                outbound=component,
+            )
         if isinstance(component, Face):
-            face_id = getattr(component, "id", None)
-            if face_id is None or not str(face_id).strip():
+            face_id = cls._clean_value(getattr(component, "id", None))
+            if not face_id:
                 return None
-            return f"face:{face_id}", component
-
+            return _RepeatCandidate(
+                kind="face",
+                source="parsed",
+                component=component,
+                fingerprint=f"face:{face_id}",
+                strategy="face-id",
+                outbound=component,
+            )
         if isinstance(component, Image):
-            fingerprint = cls._image_fingerprint(event, component)
-            outbound = cls._rebuild_image_for_send(component)
-            if fingerprint is None or outbound is None:
-                return None
-            return fingerprint, outbound
-
+            return _RepeatCandidate(
+                kind="image", source="parsed", component=component
+            )
         return None
 
     @classmethod
-    def _image_fingerprint(cls, event: AstrMessageEvent, component: Image):
-        file_unique = cls._raw_image_file_unique(event)
-        if file_unique is None:
-            file_unique = getattr(component, "file_unique", None)
-        if file_unique is not None and str(file_unique).strip():
-            return f"image:unique:{str(file_unique).strip().lower()}"
+    def _raw_media_candidate(cls, event: AstrMessageEvent):
+        raw = cls._value_of(getattr(event, "message_obj", None), "raw_message")
+        segments = cls._value_of(raw, "message")
+        if not isinstance(segments, (list, tuple)):
+            return False, None
 
-        values = [
-            getattr(component, "file", None),
-            getattr(component, "url", None),
-            getattr(component, "path", None),
-        ]
+        media = []
+        for segment in segments:
+            segment_type = cls._clean_value(
+                cls._value_of(segment, "type")
+            ).lower()
+            if segment_type in ("image", "mface"):
+                media.append((segment_type, segment))
+        if not media:
+            return False, None
+        if len(media) != 1:
+            return True, None
+
+        self_id = cls._clean_value(
+            cls._value_of(getattr(event, "message_obj", None), "self_id")
+            or cls._value_of(raw, "self_id")
+        )
+        target_segment = media[0][1]
+        for segment in segments:
+            if segment is target_segment:
+                continue
+            segment_type = cls._clean_value(
+                cls._value_of(segment, "type")
+            ).lower()
+            data = cls._value_of(segment, "data")
+            if segment_type == "reply":
+                continue
+            if segment_type == "text" and not cls._clean_value(
+                cls._value_of(data, "text")
+            ):
+                continue
+            if segment_type == "at" and self_id:
+                qq = cls._clean_value(cls._value_of(data, "qq"))
+                if qq == self_id:
+                    continue
+            return True, None
+
+        kind, segment = media[0]
+        data = cls._value_of(segment, "data")
+        parsed_image = next(
+            (
+                item
+                for item in list(event.get_messages() or [])
+                if isinstance(item, Image)
+            ),
+            None,
+        )
+        return True, _RepeatCandidate(
+            kind=kind,
+            source="raw",
+            component=parsed_image,
+            data=data,
+            channel="mface" if kind == "mface" else "event",
+        )
+
+    async def _resolve_candidate(
+        self, event: AstrMessageEvent, candidate: _RepeatCandidate, now: float
+    ):
+        if candidate.fingerprint:
+            return candidate
+        if candidate.kind not in ("image", "mface"):
+            return None
+
+        market = self._market_fingerprint(candidate)
+        if market is not None:
+            candidate.fingerprint, candidate.strategy = market
+            if candidate.kind == "mface":
+                return self._resolve_mface_channel(event, candidate)
+            candidate.outbound = self._image_from_candidate(candidate)
+            return candidate if candidate.outbound is not None else None
+        if candidate.kind == "mface":
+            candidate.strategy = "missing-market-identity"
+            return None
+
+        values = self._image_values(candidate)
         hash_values = (
-            values[0],
-            cls._normalize_image_value(values[1]),
-            values[2],
+            values["file"],
+            self._normalize_image_value(values["url"]),
+            values["path"],
         )
         for value in hash_values:
-            digest = cls._content_hash(value)
-            if digest is not None:
-                return f"image:hash:{digest}"
+            digest = self._terminal_content_hash(value)
+            if digest:
+                candidate.fingerprint = f"image:hash:{digest}"
+                candidate.strategy = "terminal-hash"
+                candidate.outbound = self._image_from_candidate(candidate)
+                return candidate if candidate.outbound is not None else None
 
-        # 没有内容哈希时，URL（去掉易失 rkey）比消息级 file token 更稳定。
-        for value in (values[1], values[2], values[0]):
-            normalized = cls._normalize_image_value(value)
-            if normalized:
-                return f"image:value:{normalized}"
+        for value in hash_values:
+            digest = self._uuid_content_hash(value)
+            if digest:
+                candidate.fingerprint = f"image:hash:{digest}"
+                candidate.strategy = "uuid-hash"
+                candidate.outbound = self._image_from_candidate(candidate)
+                return candidate if candidate.outbound is not None else None
+
+        file_unique = values["file_unique"]
+        digest = self._hash_shaped_file_unique(file_unique)
+        if digest:
+            candidate.fingerprint = f"image:unique:{digest}"
+            candidate.strategy = "file-unique-hash"
+            candidate.outbound = self._image_from_candidate(candidate)
+            return candidate if candidate.outbound is not None else None
+
+        url_value = values["url"]
+        if not url_value and values["file"].lower().startswith(
+            ("http://", "https://")
+        ):
+            url_value = values["file"]
+        normalized_url = self._normalize_image_value(url_value)
+        if normalized_url:
+            digest = hashlib.sha256(normalized_url.encode()).hexdigest()
+            candidate.fingerprint = f"image:url:{digest}"
+            candidate.strategy = "normalized-url"
+            candidate.outbound = self._image_from_candidate(candidate)
+            return candidate if candidate.outbound is not None else None
+
+        field, source = self._select_image_source(values)
+        if not source:
+            candidate.strategy = "missing-image-source"
+            return None
+        probe = self._probe_for_source(candidate.component, field, source)
+        if probe is None:
+            candidate.strategy = "invalid-image-source"
+            return None
+        candidate.probe = probe
+
+        cache = self._media_cache()
+        cache_key = hashlib.sha256(f"{field}:{source}".encode()).hexdigest()
+        cached = cache.get(cache_key)
+        if cached is not None:
+            cached_at, digest = cached
+            if now - cached_at <= _MEDIA_CACHE_TTL:
+                cache.move_to_end(cache_key)
+                candidate.fingerprint = f"image:content:{digest}"
+                candidate.strategy = "content-cache"
+                return candidate
+            cache.pop(cache_key, None)
+
+        base64_data = await probe.convert_to_base64()
+        base64_text = self._clean_value(base64_data)
+        if not base64_text:
+            candidate.strategy = "empty-content"
+            return None
+        digest = hashlib.sha256(base64_text.encode()).hexdigest()
+        cache[cache_key] = (now, digest)
+        cache.move_to_end(cache_key)
+        while len(cache) > _MEDIA_CACHE_LIMIT:
+            cache.popitem(last=False)
+        candidate.fingerprint = f"image:content:{digest}"
+        candidate.strategy = "content-sha256"
+        candidate.content_base64 = base64_text
+        candidate.outbound = self._image_from_base64(base64_text)
+        return candidate
+
+    @classmethod
+    def _market_fingerprint(cls, candidate: _RepeatCandidate):
+        package_id = cls._candidate_data_value(
+            candidate, "emoji_package_id", "emojiPackageId"
+        )
+        emoji_id = cls._candidate_data_value(
+            candidate, "emoji_id", "emojiId"
+        )
+        is_market = candidate.kind == "mface" or package_id or emoji_id
+        if not is_market:
+            return None
+        if package_id and emoji_id:
+            return f"market:{package_id}:{emoji_id}", "market-id"
+        key = cls._candidate_data_value(candidate, "key")
+        if key:
+            digest = hashlib.sha256(key.encode()).hexdigest()
+            return f"market:key:{digest}", "market-key-sha256"
         return None
 
     @classmethod
-    def _raw_image_file_unique(cls, event: AstrMessageEvent):
-        message_obj = getattr(event, "message_obj", None)
-        raw_message = cls._value_of(message_obj, "raw_message")
-        segments = cls._value_of(raw_message, "message")
-        if not isinstance(segments, (list, tuple)):
-            return None
-        for segment in segments:
-            segment_type = cls._value_of(segment, "type")
-            if str(segment_type or "").lower() != "image":
-                continue
-            data = cls._value_of(segment, "data")
-            file_unique = cls._value_of(data, "file_unique")
-            if file_unique is not None and str(file_unique).strip():
-                return file_unique
-        return None
+    def _image_values(cls, candidate: _RepeatCandidate):
+        return {
+            key: cls._candidate_data_value(candidate, key)
+            for key in ("file", "url", "path", "file_unique")
+        }
+
+    @classmethod
+    def _candidate_data_value(cls, candidate: _RepeatCandidate, *keys):
+        for key in keys:
+            value = cls._clean_value(cls._value_of(candidate.data, key))
+            if value:
+                return value
+        for key in keys:
+            value = cls._clean_value(getattr(candidate.component, key, None))
+            if value:
+                return value
+        return ""
 
     @staticmethod
-    def _content_hash(value) -> str | None:
-        if value is None:
-            return None
-        text = str(value).strip()
-        if not text:
-            return None
-        match = _CONTENT_HASH.search(text)
-        if match:
-            return match.group(1).lower()
+    def _clean_value(value) -> str:
+        return "" if value is None else str(value).strip()
+
+    @staticmethod
+    def _terminal_content_hash(value) -> str | None:
+        text = RepeatPlugin._clean_value(value)
         match = _TERMINAL_CONTENT_HASH.search(text)
-        if match:
-            return match.group(1).lower()
+        return match.group(1).lower() if match else None
+
+    @staticmethod
+    def _uuid_content_hash(value) -> str | None:
+        text = RepeatPlugin._clean_value(value)
         match = _UUID_CONTENT_HASH.search(text)
-        if match:
-            return "".join(match.groups()).lower()
-        return None
+        return "".join(match.groups()).lower() if match else None
+
+    @classmethod
+    def _hash_shaped_file_unique(cls, value) -> str | None:
+        return cls._terminal_content_hash(value) or cls._uuid_content_hash(value)
 
     @staticmethod
     def _normalize_image_value(value) -> str:
-        if value is None:
-            return ""
-        text = str(value).strip()
+        text = RepeatPlugin._clean_value(value)
         if not text:
             return ""
         if text.lower().startswith(("http://", "https://")):
             parts = urlsplit(text)
-            query = urlencode(
-                [
-                    (key, item)
-                    for key, item in parse_qsl(
-                        parts.query, keep_blank_values=True
-                    )
-                    if key.lower() != "rkey"
-                ],
-                doseq=True,
-            )
+            query_items = [
+                (key, item)
+                for key, item in parse_qsl(
+                    parts.query, keep_blank_values=True
+                )
+                if key.lower() != "rkey"
+            ]
+            query = urlencode(sorted(query_items), doseq=True)
             return urlunsplit(
                 (
                     parts.scheme.lower(),
@@ -260,31 +442,172 @@ class RepeatPlugin(Star):
         return text
 
     @staticmethod
-    def _rebuild_image_for_send(component: Image):
-        url = str(getattr(component, "url", None) or "").strip()
-        path = str(getattr(component, "path", None) or "").strip()
-        file = str(getattr(component, "file", None) or "").strip()
-        source = url or path or file
+    def _select_image_source(values):
+        for field in ("url", "path", "file"):
+            if values[field]:
+                return field, values[field]
+        return "", ""
+
+    @classmethod
+    def _probe_for_source(cls, component, field: str, source: str):
+        if isinstance(component, Image):
+            component_url = cls._clean_value(getattr(component, "url", None))
+            component_file = cls._clean_value(
+                getattr(component, "file", None)
+            )
+            if field == "url" and component_url == source:
+                return component
+            if field == "file" and not component_url and component_file == source:
+                return component
+        return cls._image_from_source(field, source)
+
+    @classmethod
+    def _image_from_candidate(cls, candidate: _RepeatCandidate):
+        values = cls._image_values(candidate)
+        field, source = cls._select_image_source(values)
+        return cls._image_from_source(field, source)
+
+    @staticmethod
+    def _image_from_source(field: str, source: str):
         if not source:
             return None
-
         if source.lower().startswith(("http://", "https://")):
             from_url = getattr(Image, "fromURL", None)
-            if callable(from_url):
-                return from_url(source)
-            return Image(file=source)
-
-        is_local_path = bool(path) or source.startswith(("/", "\\"))
-        is_local_path = is_local_path or bool(
-            re.match(r"^[a-zA-Z]:[\\/]", source)
-        )
-        if is_local_path:
-            from_file_system = getattr(Image, "fromFileSystem", None)
-            if callable(from_file_system):
-                return from_file_system(source)
+            return from_url(source) if callable(from_url) else Image(file=source)
+        is_local = field == "path" or source.startswith(("/", "\\"))
+        is_local = is_local or bool(re.match(r"^[a-zA-Z]:[\\/]", source))
+        if is_local:
+            from_file = getattr(Image, "fromFileSystem", None)
+            if callable(from_file):
+                return from_file(source)
             return Image(file=source, path=source)
-
         return Image(file=source)
+
+    @staticmethod
+    def _image_from_base64(base64_text: str):
+        from_base64 = getattr(Image, "fromBase64", None)
+        if callable(from_base64):
+            return from_base64(base64_text)
+        return Image(file=f"base64://{base64_text}")
+
+    def _media_cache(self):
+        cache = getattr(self, "_media_digest_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._media_digest_cache = cache
+        return cache
+
+    @classmethod
+    def _resolve_mface_channel(
+        cls, event: AstrMessageEvent, candidate: _RepeatCandidate
+    ):
+        bot = getattr(event, "bot", None)
+        if callable(getattr(bot, "send_group_msg", None)):
+            candidate.channel = "send_group_msg"
+            return candidate
+        if callable(getattr(bot, "call_action", None)):
+            candidate.channel = "call_action"
+            return candidate
+        gif_url = cls._candidate_data_value(
+            candidate, "url", "gif_url", "gifUrl"
+        )
+        if cls._is_gif_url(gif_url):
+            candidate.channel = "event-gif"
+            candidate.outbound = cls._image_from_source("url", gif_url)
+            return candidate
+        candidate.strategy = "missing-mface-channel"
+        return None
+
+    @staticmethod
+    def _is_gif_url(value: str) -> bool:
+        if not value.lower().startswith(("http://", "https://")):
+            return False
+        return urlsplit(value).path.lower().endswith(".gif")
+
+    async def _send_candidate(
+        self,
+        event: AstrMessageEvent,
+        candidate: _RepeatCandidate,
+        group_id: str,
+        self_id: str,
+    ) -> None:
+        if candidate.kind == "mface":
+            if candidate.channel == "event-gif":
+                await event.send(MessageChain([candidate.outbound]))
+                return
+            payload = self._mface_payload(candidate, group_id, self_id)
+            bot = getattr(event, "bot", None)
+            if candidate.channel == "send_group_msg":
+                await bot.send_group_msg(**payload)
+                return
+            if candidate.channel == "call_action":
+                await bot.call_action("send_group_msg", **payload)
+                return
+            raise RuntimeError("mface channel unavailable")
+
+        outbound = candidate.outbound
+        if candidate.kind == "image" and outbound is None:
+            base64_data = await candidate.probe.convert_to_base64()
+            base64_text = self._clean_value(base64_data)
+            if not base64_text:
+                raise ValueError("empty image content")
+            outbound = self._image_from_base64(base64_text)
+        if outbound is None:
+            raise ValueError("empty outbound component")
+        await event.send(MessageChain([outbound]))
+
+    @classmethod
+    def _mface_payload(
+        cls, candidate: _RepeatCandidate, group_id: str, self_id: str
+    ):
+        data = {}
+        aliases = {
+            "emoji_package_id": ("emoji_package_id", "emojiPackageId"),
+            "emoji_id": ("emoji_id", "emojiId"),
+            "key": ("key",),
+            "summary": ("summary",),
+        }
+        for output_key, keys in aliases.items():
+            value = cls._candidate_data_value(candidate, *keys)
+            if value:
+                data[output_key] = value
+        payload = {
+            "group_id": group_id,
+            "message": [{"type": "mface", "data": data}],
+        }
+        if self_id:
+            payload["self_id"] = self_id
+        return payload
+
+    @staticmethod
+    def _debug_media(
+        candidate: _RepeatCandidate,
+        state: _GroupState,
+        error_type: str = "-",
+    ) -> None:
+        if candidate.kind not in ("image", "mface"):
+            return
+        fingerprint = candidate.fingerprint or ""
+        short_fingerprint = (
+            hashlib.sha256(fingerprint.encode()).hexdigest()[:12]
+            if fingerprint
+            else "-"
+        )
+        logger.debug(
+            "[repeater.media] type=%s source=%s strategy=%s fp=%s "
+            "count=%d threshold=%d cooldown=%g repeated=%s "
+            "channel=%s error=%s",
+            candidate.kind,
+            candidate.source,
+            candidate.strategy,
+            short_fingerprint,
+            len(state.senders),
+            state.threshold,
+            state.cooldown,
+            state.repeated_in_segment,
+            candidate.channel,
+            error_type,
+        )
 
     @staticmethod
     def _commit_repeat(state: _GroupState, now: float) -> None:
@@ -316,25 +639,53 @@ class RepeatPlugin(Star):
         # 忽略复读机指令本身
         if text.strip() and _CMD_PATTERN.match(text.strip()):
             return
-        repeatable = self._extract_repeatable_component(event)
-        if repeatable is None:
+        candidate = self._extract_candidate(event)
+        if candidate is None:
             return
-        fingerprint, component = repeatable
         state = self._get_group(group_id)
         async with state.lock:
+            try:
+                candidate = await self._resolve_candidate(
+                    event, candidate, time.monotonic()
+                )
+            except Exception as e:
+                unresolved = candidate
+                unresolved.strategy = "resolve-error"
+                self._debug_media(unresolved, state, type(e).__name__)
+                logger.warning(
+                    "解析复读媒体失败（群 %s，%s）",
+                    group_id,
+                    type(e).__name__,
+                )
+                return
+            if candidate is None:
+                return
             repeat_fingerprint = self.process_message(
-                group_id, sender_id, fingerprint, time.monotonic()
+                group_id,
+                sender_id,
+                candidate.fingerprint,
+                time.monotonic(),
             )
+            self._debug_media(candidate, state)
             if repeat_fingerprint is None:
                 return
             try:
-                await event.send(MessageChain([component]))
+                await self._send_candidate(
+                    event,
+                    candidate,
+                    group_id,
+                    str(getattr(msg, "self_id", "") or ""),
+                )
             except Exception as e:
+                self._debug_media(candidate, state, type(e).__name__)
                 logger.warning(
-                    "发送复读消息失败（群 %s）: %s", group_id, e
+                    "发送复读消息失败（群 %s，%s）",
+                    group_id,
+                    type(e).__name__,
                 )
                 return
             self._commit_repeat(state, time.monotonic())
+            self._debug_media(candidate, state)
 
     # ------------------------------------------------------------------
     # 指令组：群内控制
