@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
+import hashlib
 import unittest
 from collections import OrderedDict
 from types import SimpleNamespace
@@ -100,6 +102,18 @@ def raw_segment(segment_type, **data):
 
 def raw_event(*segments, self_id="bot"):
     return {"self_id": self_id, "message": list(segments)}
+
+
+def encoded(value):
+    if isinstance(value, str):
+        value = value.encode()
+    return base64.b64encode(value).decode()
+
+
+def rendered_debugs():
+    return "\n".join(
+        str(args[0]) % tuple(args[1:]) for args in LOGGER.debugs
+    )
 
 
 class FakeDirectBot:
@@ -368,11 +382,11 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
             (
                 Image(
                     file="message-token",
-                    url="https://example.test/a.png",
+                    url="https://example.test/a.png?fileid=stable-a",
                     path="/tmp/not-selected.png",
                 ),
                 "url",
-                "https://example.test/a.png",
+                "https://example.test/a.png?fileid=stable-a",
             ),
             (
                 Image(
@@ -383,9 +397,11 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 f"/tmp/{digest}.png",
             ),
             (
-                Image(file="https://example.test/from-file.png"),
+                Image(
+                    file="https://example.test/from-file.png?fileid=stable-b"
+                ),
                 "url",
-                "https://example.test/from-file.png",
+                "https://example.test/from-file.png?fileid=stable-b",
             ),
             (
                 Image(file=f"/tmp/{digest}.png"),
@@ -469,15 +485,29 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
         events.append(await deliver(plugin, "g", "u1", "", 1, messages=[Face(1)]))
         events.append(await deliver(plugin, "g", "u2", "", 2, messages=[Face(1)]))
         events.append(
-            await deliver(plugin, "g", "u1", "", 3, messages=[Image(file="x")])
+            await deliver(
+                plugin,
+                "g",
+                "u1",
+                "",
+                3,
+                messages=[Image(file="x", base64_data=encoded("x"))],
+            )
         )
         events.append(
-            await deliver(plugin, "g", "u2", "", 4, messages=[Image(file="x")])
+            await deliver(
+                plugin,
+                "g",
+                "u2",
+                "",
+                4,
+                messages=[Image(file="x", base64_data=encoded("x"))],
+            )
         )
 
         self.assertEqual(
             sent_values(*events),
-            [("face", 1), ("image", "base64://x", None, None)],
+            [("face", 1), ("image", f"base64://{encoded('x')}", None, None)],
         )
 
     async def test_mixed_or_multi_component_message_is_ignored_without_cutting_segment(self):
@@ -506,7 +536,12 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent_values(trigger), [("face", 7)])
 
     async def test_image_and_face_send_failure_can_retry(self):
-        for component_factory in (lambda: Face(9), lambda: Image(url="image-url")):
+        for component_factory in (
+            lambda: Face(9),
+            lambda: Image(
+                file="opaque-image", base64_data=encoded("image-content")
+            ),
+        ):
             with self.subTest(component=type(component_factory()).__name__):
                 plugin = make_plugin()
                 await deliver(
@@ -543,21 +578,41 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await deliver(plugin, "g", "u1", "", 100, messages=[Face(1)])
         first = await deliver(plugin, "g", "u2", "", 101, messages=[Face(1)])
         during_one = await deliver(
-            plugin, "g", "u3", "", 105, messages=[Image(file="x")]
+            plugin,
+            "g",
+            "u3",
+            "",
+            105,
+            messages=[Image(file="x", base64_data=encoded("x"))],
         )
         during_two = await deliver(
-            plugin, "g", "u4", "", 106, messages=[Image(file="x")]
+            plugin,
+            "g",
+            "u4",
+            "",
+            106,
+            messages=[Image(file="x", base64_data=encoded("x"))],
         )
         after_one = await deliver(
-            plugin, "g", "u3", "", 111, messages=[Image(file="x")]
+            plugin,
+            "g",
+            "u3",
+            "",
+            111,
+            messages=[Image(file="x", base64_data=encoded("x"))],
         )
         after_two = await deliver(
-            plugin, "g", "u4", "", 112, messages=[Image(file="x")]
+            plugin,
+            "g",
+            "u4",
+            "",
+            112,
+            messages=[Image(file="x", base64_data=encoded("x"))],
         )
 
         self.assertEqual(
             sent_values(first, during_one, during_two, after_one, after_two),
-            [("face", 1), ("image", "base64://x", None, None)],
+            [("face", 1), ("image", f"base64://{encoded('x')}", None, None)],
         )
 
     async def test_unicode_emoji_remains_a_plain_message(self):
@@ -583,7 +638,7 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 raw_segment(
                     "image",
                     file="message-token",
-                    url="https://example.test/raw.png",
+                    url="https://example.test/raw.png?fileid=raw-stable",
                     file_unique="abc123",
                 )
             ),
@@ -594,7 +649,7 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
                         type="image",
                         data=SimpleNamespace(
                             file="message-token",
-                            url="https://example.test/raw.png",
+                            url="https://example.test/raw.png?fileid=raw-stable",
                             file_unique="abc123",
                         ),
                     )
@@ -622,7 +677,7 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
             raw_segment(
                 "image",
                 file="opaque",
-                url="https://example.test/helper.png",
+                url="https://example.test/helper.png?fileid=helper-stable",
                 file_unique="helper-image",
             ),
         )
@@ -708,6 +763,39 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(trigger.sent, [])
+        self.assertEqual(len(bot.send_group_calls), 1)
+
+    async def test_market_emoji_id_is_stable_without_package_id(self):
+        plugin = make_plugin()
+        bot = FakeDirectBot()
+        first = raw_event(
+            raw_segment("mface", emoji_id="99", key="rotating-key-one")
+        )
+        second = raw_event(
+            raw_segment("mface", emoji_id="99", key="rotating-key-two")
+        )
+
+        await deliver(
+            plugin,
+            "g",
+            "u1",
+            "",
+            1,
+            messages=[],
+            raw_message=first,
+            bot=bot,
+        )
+        await deliver(
+            plugin,
+            "g",
+            "u2",
+            "",
+            2,
+            messages=[],
+            raw_message=second,
+            bot=bot,
+        )
+
         self.assertEqual(len(bot.send_group_calls), 1)
 
     async def test_legacy_mface_uses_whitelisted_direct_payload_then_call_action(self):
@@ -831,8 +919,12 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_opaque_images_use_base64_content_digest(self):
         plugin = make_plugin()
-        first = Image(file="opaque-token-one", base64_data="same-content")
-        triggering = Image(file="opaque-token-two", base64_data="same-content")
+        first = Image(
+            file="opaque-token-one", base64_data=encoded("same-content")
+        )
+        triggering = Image(
+            file="opaque-token-two", base64_data=encoded("same-content")
+        )
 
         await deliver(plugin, "g", "u1", "", 1, messages=[first])
         trigger = await deliver(
@@ -843,8 +935,12 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(trigger.sent[0].constructed_by, "base64")
 
         other = make_plugin()
-        different_one = Image(file="opaque-a", base64_data="content-a")
-        different_two = Image(file="opaque-b", base64_data="content-b")
+        different_one = Image(
+            file="opaque-a", base64_data=encoded("content-a")
+        )
+        different_two = Image(
+            file="opaque-b", base64_data=encoded("content-b")
+        )
         await deliver(other, "g", "u1", "", 1, messages=[different_one])
         no_trigger = await deliver(
             other, "g", "u2", "", 2, messages=[different_two]
@@ -855,11 +951,147 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
             "image:value:opaque-b",
         )
 
+    async def test_dynamic_urls_with_same_bytes_share_content_identity(self):
+        plugin = make_plugin()
+        content = encoded(b"same-real-image-bytes")
+        first = Image(
+            file="token-one",
+            url="https://cdn-one.test/download?rkey=one",
+            base64_data=content,
+        )
+        second = Image(
+            file="token-two",
+            url="https://cdn-two.test/other?rkey=two",
+            base64_data=content,
+        )
+
+        await deliver(plugin, "g", "u1", "", 1, messages=[first])
+        trigger = await deliver(plugin, "g", "u2", "", 2, messages=[second])
+
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertEqual(trigger.sent[0].base64_data, content)
+
+    async def test_base64_forms_hash_decoded_bytes_and_send_canonical_bare(self):
+        plugin = make_plugin(threshold=3)
+        raw_bytes = b"\x00same image bytes\xff"
+        canonical = encoded(raw_bytes)
+        forms = (
+            f" {canonical[:8]} \n{canonical[8:]} ",
+            f"base64://{canonical}",
+            f"data:image/png;base64,{canonical[:5]} \r\n{canonical[5:]}",
+        )
+        events = []
+        for index, form in enumerate(forms):
+            events.append(
+                await deliver(
+                    plugin,
+                    "g",
+                    f"u{index}",
+                    "",
+                    index,
+                    messages=[
+                        Image(file=f"opaque-{index}", base64_data=form)
+                    ],
+                )
+            )
+
+        self.assertEqual(len(events[-1].sent), 1)
+        output = events[-1].sent[0]
+        self.assertEqual(output.base64_data, canonical)
+        self.assertEqual(output.file, f"base64://{canonical}")
+        expected = hashlib.sha256(raw_bytes).hexdigest()
+        self.assertEqual(
+            plugin._groups["g"].current_fingerprint,
+            f"image:content:{expected}",
+        )
+
+        different = make_plugin()
+        await deliver(
+            different,
+            "g",
+            "u1",
+            "",
+            1,
+            messages=[Image(file="opaque-a", base64_data=encoded(b"a"))],
+        )
+        no_trigger = await deliver(
+            different,
+            "g",
+            "u2",
+            "",
+            2,
+            messages=[
+                Image(
+                    file="opaque-b",
+                    base64_data=f"data:image/gif;base64,{encoded(b'b')}",
+                )
+            ],
+        )
+        self.assertEqual(no_trigger.sent, [])
+
+    async def test_skip_diagnostics_cover_raw_and_parsed_reasons_redacted(self):
+        invalid = (
+            raw_event(
+                raw_segment("image", file="secret-token-one"),
+                raw_segment("mface", key="secret-key-one"),
+            ),
+            raw_event(
+                raw_segment(
+                    "image",
+                    url="https://secret.test/a?rkey=secret-rkey",
+                ),
+                raw_segment("text", text="secret-body"),
+            ),
+            raw_event(
+                raw_segment("image", file="secret-token-two"),
+                raw_segment("at", qq="secret-other-user"),
+            ),
+            raw_event(raw_segment("mface", summary="secret-summary")),
+            raw_event(raw_segment("image")),
+        )
+        for index, raw in enumerate(invalid):
+            await deliver(
+                make_plugin(),
+                "g",
+                f"u{index}",
+                "",
+                index,
+                messages=[],
+                raw_message=raw,
+            )
+        await deliver(
+            make_plugin(), "g", "parsed", "", 10, messages=[Image()]
+        )
+
+        diagnostics = rendered_debugs()
+        for reason in (
+            "multiple-media",
+            "nonblank-text",
+            "other-at",
+            "missing-identity",
+            "missing-source",
+        ):
+            self.assertIn(f"reason={reason}", diagnostics)
+        self.assertIn("source=raw", diagnostics)
+        self.assertIn("source=parsed", diagnostics)
+        for secret in (
+            "secret-token",
+            "https://secret.test",
+            "secret-rkey",
+            "secret-key",
+            "secret-body",
+            "secret-summary",
+            "secret-other-user",
+        ):
+            self.assertNotIn(secret, diagnostics)
+
     async def test_weak_path_is_rebuilt_before_content_digest(self):
         plugin = make_plugin()
+        path_content = encoded("/tmp/no-hash.png")
         first = Image(file="message-token-one", path="/tmp/no-hash.png")
         triggering = Image(
-            file="message-token-two", path="/tmp/no-hash.png"
+            file="message-token-two",
+            path="/tmp/no-hash.png",
         )
 
         await deliver(plugin, "g", "u1", "", 1, messages=[first])
@@ -869,13 +1101,14 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(trigger.sent), 1)
         self.assertEqual(trigger.sent[0].constructed_by, "base64")
-        self.assertEqual(trigger.sent[0].file, "base64:///tmp/no-hash.png")
+        self.assertEqual(trigger.sent[0].file, f"base64://{path_content}")
 
     async def test_media_digest_cache_is_bounded_and_expires(self):
         plugin = make_plugin(threshold=50)
-        first = Image(file="opaque-cache", base64_data="cache-content")
-        cached = Image(file="opaque-cache", base64_data="cache-content")
-        expired = Image(file="opaque-cache", base64_data="cache-content")
+        cache_content = encoded("cache-content")
+        first = Image(file="opaque-cache", base64_data=cache_content)
+        cached = Image(file="opaque-cache", base64_data=cache_content)
+        expired = Image(file="opaque-cache", base64_data=cache_content)
 
         await deliver(plugin, "g", "u1", "", 0, messages=[first])
         await deliver(plugin, "g", "u2", "", 1, messages=[cached])
@@ -896,7 +1129,7 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 messages=[
                     Image(
                         file=f"opaque-{index}",
-                        base64_data=f"content-{index}",
+                        base64_data=encoded(f"content-{index}"),
                     )
                 ],
             )
@@ -923,7 +1156,10 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
             raw_segment(
                 "image",
                 file="complete-private-token",
-                url="https://example.test/private.gif?rkey=private-rkey",
+                url=(
+                    "https://example.test/private.gif?"
+                    "fileid=private-fileid&rkey=private-rkey"
+                ),
                 file_unique="private-file-unique",
                 key="private-market-key",
             )

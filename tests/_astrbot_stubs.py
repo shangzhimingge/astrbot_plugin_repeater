@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import sys
 import types
 
@@ -113,7 +114,11 @@ class Image:
         """Record the source the aiocqhttp adapter would try to convert."""
         self.convert_calls += 1
         self.converted_source = self.url or self.file
-        return self.base64_data or self.converted_source
+        if self.base64_data is not None:
+            return self.base64_data
+        if self.converted_source is None:
+            return None
+        return base64.b64encode(str(self.converted_source).encode()).decode()
 
 
 class MessageChain(list):

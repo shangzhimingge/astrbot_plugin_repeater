@@ -9,6 +9,7 @@
 #      事件监听 / 指令处理只是薄封装。持久化数据存放于 AstrBot 的 data 目录。
 
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -71,6 +72,7 @@ class _RepeatCandidate:
     data: object | None = None
     fingerprint: str | None = None
     strategy: str = "pending"
+    reason: str = "-"
     channel: str = "event"
     outbound: object | None = None
     probe: object | None = None
@@ -213,6 +215,7 @@ class RepeatPlugin(Star):
         if not media:
             return False, None
         if len(media) != 1:
+            cls._debug_skip("multiple", "raw", "multiple-media")
             return True, None
 
         self_id = cls._clean_value(
@@ -233,10 +236,19 @@ class RepeatPlugin(Star):
                 cls._value_of(data, "text")
             ):
                 continue
+            if segment_type == "text":
+                cls._debug_skip(kind=media[0][0], source="raw", reason="nonblank-text")
+                return True, None
             if segment_type == "at" and self_id:
                 qq = cls._clean_value(cls._value_of(data, "qq"))
                 if qq == self_id:
                     continue
+            if segment_type == "at":
+                cls._debug_skip(kind=media[0][0], source="raw", reason="other-at")
+                return True, None
+            cls._debug_skip(
+                kind=media[0][0], source="raw", reason="unsupported-helper"
+            )
             return True, None
 
         kind, segment = media[0]
@@ -271,9 +283,12 @@ class RepeatPlugin(Star):
             if candidate.kind == "mface":
                 return self._resolve_mface_channel(event, candidate)
             candidate.outbound = self._image_from_candidate(candidate)
+            if candidate.outbound is None:
+                candidate.reason = "missing-source"
             return candidate if candidate.outbound is not None else None
         if candidate.kind == "mface":
             candidate.strategy = "missing-market-identity"
+            candidate.reason = "missing-identity"
             return None
 
         values = self._image_values(candidate)
@@ -312,7 +327,7 @@ class RepeatPlugin(Star):
         ):
             url_value = values["file"]
         normalized_url = self._normalize_image_value(url_value)
-        if normalized_url:
+        if normalized_url and self._has_stable_fileid(normalized_url):
             digest = hashlib.sha256(normalized_url.encode()).hexdigest()
             candidate.fingerprint = f"image:url:{digest}"
             candidate.strategy = "normalized-url"
@@ -322,10 +337,12 @@ class RepeatPlugin(Star):
         field, source = self._select_image_source(values)
         if not source:
             candidate.strategy = "missing-image-source"
+            candidate.reason = "missing-source"
             return None
         probe = self._probe_for_source(candidate.component, field, source)
         if probe is None:
             candidate.strategy = "invalid-image-source"
+            candidate.reason = "invalid-source"
             return None
         candidate.probe = probe
 
@@ -342,11 +359,12 @@ class RepeatPlugin(Star):
             cache.pop(cache_key, None)
 
         base64_data = await probe.convert_to_base64()
-        base64_text = self._clean_value(base64_data)
-        if not base64_text:
+        content_bytes, base64_text = self._decode_base64_content(base64_data)
+        if not content_bytes:
             candidate.strategy = "empty-content"
+            candidate.reason = "empty-content"
             return None
-        digest = hashlib.sha256(base64_text.encode()).hexdigest()
+        digest = hashlib.sha256(content_bytes).hexdigest()
         cache[cache_key] = (now, digest)
         cache.move_to_end(cache_key)
         while len(cache) > _MEDIA_CACHE_LIMIT:
@@ -368,8 +386,8 @@ class RepeatPlugin(Star):
         is_market = candidate.kind == "mface" or package_id or emoji_id
         if not is_market:
             return None
-        if package_id and emoji_id:
-            return f"market:{package_id}:{emoji_id}", "market-id"
+        if emoji_id:
+            return f"market:emoji:{emoji_id}", "market-emoji-id"
         key = cls._candidate_data_value(candidate, "key")
         if key:
             digest = hashlib.sha256(key.encode()).hexdigest()
@@ -440,6 +458,41 @@ class RepeatPlugin(Star):
                 )
             )
         return text
+
+    @staticmethod
+    def _has_stable_fileid(normalized_url: str) -> bool:
+        try:
+            query = parse_qsl(
+                urlsplit(normalized_url).query, keep_blank_values=True
+            )
+        except ValueError:
+            return False
+        return any(
+            key.lower() in ("fileid", "file_id") and bool(value.strip())
+            for key, value in query
+        )
+
+    @staticmethod
+    def _decode_base64_content(value):
+        if isinstance(value, bytes):
+            text = value.decode("ascii")
+        else:
+            text = str(value or "")
+        text = re.sub(r"\s+", "", text)
+        lowered = text.lower()
+        if lowered.startswith("data:"):
+            header, separator, text = text.partition(",")
+            if not separator or ";base64" not in header.lower():
+                raise ValueError("invalid data URI")
+        elif lowered.startswith("base64://"):
+            text = text[len("base64://") :]
+        text = re.sub(r"\s+", "", text)
+        if not text:
+            return b"", ""
+        padded = text + "=" * (-len(text) % 4)
+        decoded = base64.b64decode(padded, validate=True)
+        canonical = base64.b64encode(decoded).decode("ascii")
+        return decoded, canonical
 
     @staticmethod
     def _select_image_source(values):
@@ -516,6 +569,7 @@ class RepeatPlugin(Star):
             candidate.outbound = cls._image_from_source("url", gif_url)
             return candidate
         candidate.strategy = "missing-mface-channel"
+        candidate.reason = "missing-channel"
         return None
 
     @staticmethod
@@ -548,8 +602,10 @@ class RepeatPlugin(Star):
         outbound = candidate.outbound
         if candidate.kind == "image" and outbound is None:
             base64_data = await candidate.probe.convert_to_base64()
-            base64_text = self._clean_value(base64_data)
-            if not base64_text:
+            content_bytes, base64_text = self._decode_base64_content(
+                base64_data
+            )
+            if not content_bytes:
                 raise ValueError("empty image content")
             outbound = self._image_from_base64(base64_text)
         if outbound is None:
@@ -596,7 +652,7 @@ class RepeatPlugin(Star):
         logger.debug(
             "[repeater.media] type=%s source=%s strategy=%s fp=%s "
             "count=%d threshold=%d cooldown=%g repeated=%s "
-            "channel=%s error=%s",
+            "channel=%s reason=%s error=%s",
             candidate.kind,
             candidate.source,
             candidate.strategy,
@@ -606,7 +662,17 @@ class RepeatPlugin(Star):
             state.cooldown,
             state.repeated_in_segment,
             candidate.channel,
+            candidate.reason,
             error_type,
+        )
+
+    @staticmethod
+    def _debug_skip(kind: str, source: str, reason: str) -> None:
+        logger.debug(
+            "[repeater.media] type=%s source=%s reason=%s",
+            kind,
+            source,
+            reason,
         )
 
     @staticmethod
@@ -644,12 +710,12 @@ class RepeatPlugin(Star):
             return
         state = self._get_group(group_id)
         async with state.lock:
+            unresolved = candidate
             try:
-                candidate = await self._resolve_candidate(
+                resolved = await self._resolve_candidate(
                     event, candidate, time.monotonic()
                 )
             except Exception as e:
-                unresolved = candidate
                 unresolved.strategy = "resolve-error"
                 self._debug_media(unresolved, state, type(e).__name__)
                 logger.warning(
@@ -658,8 +724,10 @@ class RepeatPlugin(Star):
                     type(e).__name__,
                 )
                 return
-            if candidate is None:
+            if resolved is None:
+                self._debug_media(unresolved, state)
                 return
+            candidate = resolved
             repeat_fingerprint = self.process_message(
                 group_id,
                 sender_id,
