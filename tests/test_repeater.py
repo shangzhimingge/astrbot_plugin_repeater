@@ -57,17 +57,23 @@ class FakeEvent:
     async def send(self, chain):
         if self._send_hook:
             await self._send_hook()
-        if isinstance(chain[0], Image):
-            await chain[0].convert_to_base64()
-        self.sent.append(chain[0])
+        for component in chain:
+            if isinstance(component, Image):
+                await component.convert_to_base64()
+        self.sent.extend(chain)
 
     def plain_result(self, text):
         return text
 
 
-def make_plugin(*, threshold=2, cooldown=0):
+def make_plugin(*, threshold=2, cooldown=0, media_diagnostics=False):
     plugin = object.__new__(main.RepeatPlugin)
-    plugin.config = {"enable": True, "threshold": threshold, "cooldown": cooldown}
+    plugin.config = {
+        "enable": True,
+        "threshold": threshold,
+        "cooldown": cooldown,
+        "media_diagnostics": media_diagnostics,
+    }
     plugin._groups = {}
     plugin._media_digest_cache = OrderedDict()
     plugin._save_state = lambda: None
@@ -113,6 +119,12 @@ def encoded(value):
 def rendered_debugs():
     return "\n".join(
         str(args[0]) % tuple(args[1:]) for args in LOGGER.debugs
+    )
+
+
+def rendered_infos():
+    return "\n".join(
+        str(args[0]) % tuple(args[1:]) for args in LOGGER.infos
     )
 
 
@@ -628,9 +640,244 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.real_time = main.time
         main.time = _FakeTime
         LOGGER.debugs.clear()
+        LOGGER.infos.clear()
+        Image.conversion_failures.clear()
+        Image.conversion_payloads.clear()
 
     async def asyncTearDown(self):
+        Image.conversion_failures.clear()
+        Image.conversion_payloads.clear()
         main.time = self.real_time
+
+    @staticmethod
+    def _face_image_raw(face_id, image_file, *, image_first=False):
+        face = raw_segment("face", id=str(face_id))
+        image = raw_segment("image", file=image_file)
+        parts = (image, face) if image_first else (face, image)
+        return raw_event(*parts)
+
+    async def test_raw_face_image_chain_repeats_in_original_order(self):
+        plugin = make_plugin()
+        raw = self._face_image_raw(339, "raw-token")
+        parsed_one = Image(file="parsed-token", base64_data=encoded("photo"))
+        parsed_two = Image(file="parsed-token", base64_data=encoded("photo"))
+
+        await deliver(
+            plugin, "g", "u1", "", 1,
+            messages=[Face(339), parsed_one], raw_message=raw,
+        )
+        trigger = await deliver(
+            plugin, "g", "u2", "", 2,
+            messages=[Face(339), parsed_two], raw_message=raw,
+        )
+
+        self.assertEqual(sent_values(trigger), [
+            ("face", 339),
+            ("image", f"base64://{encoded('photo')}", None, None),
+        ])
+
+    async def test_face_image_identity_includes_face_image_and_order(self):
+        plugin = make_plugin()
+
+        async def put(sender, now, face_id, image_file, image_first=False):
+            raw = self._face_image_raw(
+                face_id, image_file, image_first=image_first
+            )
+            image = Image(file=image_file, base64_data=encoded(image_file))
+            parsed = [image, Face(face_id)] if image_first else [Face(face_id), image]
+            return await deliver(
+                plugin, "g", sender, "", now,
+                messages=parsed, raw_message=raw,
+            )
+
+        events = [
+            await put("u1", 1, 339, "image-a"),
+            await put("u2", 2, 340, "image-a"),
+            await put("u3", 3, 339, "image-b"),
+            await put("u4", 4, 339, "image-b", True),
+            await put("u5", 5, 339, "image-b", True),
+        ]
+
+        self.assertEqual(sent_values(*events[:-1]), [])
+        self.assertEqual(sent_values(events[-1]), [
+            ("image", f"base64://{encoded('image-b')}", None, None),
+            ("face", 339),
+        ])
+
+    async def test_face_image_chain_repeats_once_then_after_new_segment(self):
+        plugin = make_plugin()
+
+        async def put(sender, now, face_id, image_file):
+            raw = self._face_image_raw(face_id, image_file)
+            return await deliver(
+                plugin, "g", sender, "", now,
+                messages=[
+                    Face(face_id),
+                    Image(file=image_file, base64_data=encoded(image_file)),
+                ],
+                raw_message=raw,
+            )
+
+        events = [
+            await put("u1", 1, 339, "image-a"),
+            await put("u2", 2, 339, "image-a"),
+            await put("u3", 3, 339, "image-a"),
+            await put("u4", 4, 340, "image-a"),
+            await put("u5", 5, 339, "image-a"),
+            await put("u6", 6, 339, "image-a"),
+        ]
+
+        self.assertEqual(len(sent_values(*events)), 4)
+        self.assertEqual(len(events[1].sent), 2)
+        self.assertEqual(events[2].sent, [])
+        self.assertEqual(len(events[-1].sent), 2)
+
+    async def test_face_image_send_failure_retries_complete_chain(self):
+        plugin = make_plugin()
+        raw = self._face_image_raw(339, "raw-token")
+
+        await deliver(
+            plugin, "g", "u1", "", 1,
+            messages=[Face(339), Image(file="parsed", base64_data=encoded("p"))],
+            raw_message=raw,
+        )
+
+        async def fail():
+            raise RuntimeError("send failed")
+
+        failed = await deliver(
+            plugin, "g", "u2", "", 2, fail,
+            messages=[Face(339), Image(file="parsed", base64_data=encoded("p"))],
+            raw_message=raw,
+        )
+        retried = await deliver(
+            plugin, "g", "u3", "", 3,
+            messages=[Face(339), Image(file="parsed", base64_data=encoded("p"))],
+            raw_message=raw,
+        )
+
+        self.assertEqual(failed.sent, [])
+        self.assertEqual(len(retried.sent), 2)
+        self.assertTrue(plugin._groups["g"].repeated_in_segment)
+
+    async def test_raw_weak_file_does_not_mask_parsed_image_identity(self):
+        digest = "0123456789abcdef0123456789abcdef"
+        cases = (
+            (lambda: Image(file=f"C:/cache/{digest}.png"), "path"),
+            (lambda: Image(file="weak", path=f"C:/cache/{digest}.png"), "path"),
+            (
+                lambda: Image(
+                    file="weak",
+                    url="https://parsed.test/image?fileid=stable-image",
+                ),
+                "url",
+            ),
+        )
+        for factory, constructor in cases:
+            with self.subTest(constructor=constructor, image=vars(factory())):
+                plugin = make_plugin()
+
+                async def put(sender, now, raw_token):
+                    raw = self._face_image_raw(339, raw_token)
+                    return await deliver(
+                        plugin, "g", sender, "", now,
+                        messages=[Face(339), factory()], raw_message=raw,
+                    )
+
+                await put("u1", 1, "raw-message-token-one")
+                trigger = await put("u2", 2, "raw-message-token-two")
+
+                self.assertEqual(len(trigger.sent), 2)
+                self.assertEqual(trigger.sent[1].constructed_by, constructor)
+
+    async def test_image_probe_falls_back_until_a_source_converts(self):
+        plugin = make_plugin()
+        bad_parsed_url = "https://parsed.test/image?rkey=secret"
+        bad_raw_url = "https://raw.test/image?rkey=secret"
+        good_path = "C:/cache/fallback-image.bin"
+        Image.conversion_failures.update({bad_parsed_url, bad_raw_url})
+        Image.conversion_payloads[good_path] = encoded("fallback-bytes")
+
+        async def put(sender, now, raw_file):
+            raw = raw_event(raw_segment(
+                "image", file=raw_file, url=bad_raw_url
+            ))
+            parsed = Image(
+                file="parsed-file", url=bad_parsed_url, path=good_path
+            )
+            return await deliver(
+                plugin, "g", sender, "", now,
+                messages=[parsed], raw_message=raw,
+            )
+
+        await put("u1", 1, "raw-one")
+        trigger = await put("u2", 2, "raw-two")
+
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertEqual(trigger.sent[0].base64_data, encoded("fallback-bytes"))
+
+    async def test_media_diagnostics_promotes_redacted_trace_to_info(self):
+        raw = raw_event(
+            raw_segment("face", id="987654321"),
+            raw_segment(
+                "image",
+                file="secret-token",
+                url="https://secret.test/image?rkey=secret-rkey",
+            ),
+        )
+        enabled = make_plugin(media_diagnostics=True)
+        await deliver(
+            enabled, "secret-group", "secret-user-one", "secret-body", 1,
+            messages=[
+                Face(987654321),
+                Image(
+                    file="parsed-secret",
+                    base64_data=encoded("secret-image-bytes"),
+                ),
+            ],
+            raw_message=raw,
+        )
+
+        async def fail():
+            raise RuntimeError("secret-send-error")
+
+        await deliver(
+            enabled, "secret-group", "secret-user-two", "secret-body", 2,
+            send_hook=fail,
+            messages=[
+                Face(987654321),
+                Image(
+                    file="parsed-secret",
+                    base64_data=encoded("secret-image-bytes"),
+                ),
+            ],
+            raw_message=raw,
+        )
+
+        info = rendered_infos()
+        self.assertIn("[repeater.media]", info)
+        self.assertIn("source=raw", info)
+        self.assertIn("strategy=chain-", info)
+        self.assertIn("fp=", info)
+        self.assertIn("count=", info)
+        self.assertIn("threshold=2", info)
+        self.assertIn("result=send-error", info)
+        self.assertIn("error=RuntimeError", info)
+        for secret in (
+            "987654321", "secret-token", "https://secret.test",
+            "secret-rkey", "secret-group", "secret-user-one",
+            "secret-user-two", "secret-body", "secret-send-error",
+            encoded("secret-image-bytes"),
+        ):
+            self.assertNotIn(secret, info)
+
+        LOGGER.infos.clear()
+        disabled = make_plugin()
+        await deliver(
+            disabled, "g", "u", "", 2,
+            messages=[Image(file="quiet", base64_data=encoded("quiet"))],
+        )
+        self.assertEqual(LOGGER.infos, [])
 
     async def test_raw_image_repeats_when_parsed_chain_is_empty(self):
         cases = (

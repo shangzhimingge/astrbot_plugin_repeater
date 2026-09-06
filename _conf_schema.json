@@ -23,5 +23,11 @@
     "type": "int",
     "default": 0,
     "hint": "每次触发后机器人冷却 N 秒再响应，0 表示无冷却"
+  },
+  "media_diagnostics": {
+    "description": "是否在 Info 日志中输出脱敏媒体诊断",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后可用 [repeater.media] 排查图片计数与发送；日志不含消息正文、媒体地址或标识原文"
   }
 }

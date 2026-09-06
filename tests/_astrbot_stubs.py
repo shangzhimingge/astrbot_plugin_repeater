@@ -11,9 +11,10 @@ class _Logger:
     def __init__(self):
         self.warnings: list[tuple[object, ...]] = []
         self.debugs: list[tuple[object, ...]] = []
+        self.infos: list[tuple[object, ...]] = []
 
     def info(self, *args, **kwargs):
-        pass
+        self.infos.append(args)
 
     def warning(self, *args, **kwargs):
         self.warnings.append(args)
@@ -75,6 +76,9 @@ class Reply:
 
 
 class Image:
+    conversion_failures: set[str] = set()
+    conversion_payloads: dict[str, str] = {}
+
     def __init__(
         self,
         file=None,
@@ -113,7 +117,11 @@ class Image:
     async def convert_to_base64(self):
         """Record the source the aiocqhttp adapter would try to convert."""
         self.convert_calls += 1
-        self.converted_source = self.url or self.file
+        self.converted_source = self.url or self.path or self.file
+        if self.converted_source in self.conversion_failures:
+            raise RuntimeError("image probe failed")
+        if self.converted_source in self.conversion_payloads:
+            return self.conversion_payloads[self.converted_source]
         if self.base64_data is not None:
             return self.base64_data
         if self.converted_source is None:

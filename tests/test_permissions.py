@@ -95,6 +95,13 @@ class PermissionDecoratorTests(unittest.TestCase):
             permission["labels"], ["群成员", "群管理员", "群主", "BOT主人"]
         )
 
+    def test_schema_media_diagnostics_is_disabled_by_default(self):
+        schema = json.loads(Path("_conf_schema.json").read_text(encoding="utf-8"))
+
+        diagnostics = schema["media_diagnostics"]
+        self.assertEqual(diagnostics["type"], "bool")
+        self.assertFalse(diagnostics["default"])
+
 
 class RuntimePermissionTests(unittest.IsolatedAsyncioTestCase):
     async def test_config_changes_are_applied_on_the_next_command(self):
