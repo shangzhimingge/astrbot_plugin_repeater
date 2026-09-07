@@ -486,23 +486,20 @@ class RepeatPlugin(Star):
         raw = cls._raw_image_values(candidate)
         parsed = cls._parsed_image_values(candidate)
 
-        urls = []
-        for values in (raw, parsed):
-            if values["url"]:
-                urls.append(values["url"])
-            if values["file"].lower().startswith(("http://", "https://")):
-                urls.append(values["file"])
-        for value in urls:
-            normalized = cls._normalize_image_value(value)
-            digest = cls._terminal_content_hash(normalized)
-            if digest:
-                return f"image:hash:{digest}", "url-content-hash"
-            digest = cls._uuid_content_hash(normalized)
-            if digest:
-                return f"image:hash:{digest}", "url-uuid-hash"
-            if normalized and cls._has_stable_fileid(normalized):
-                digest = hashlib.sha256(normalized.encode()).hexdigest()
-                return f"image:url:{digest}", "normalized-url"
+        if isinstance(candidate.component, Image):
+            for field in ("file", "url", "path"):
+                value = parsed[field]
+                if field == "url" or not value:
+                    continue
+                digest = cls._terminal_content_hash(value)
+                if digest:
+                    return f"image:hash:{digest}", "terminal-hash"
+                digest = cls._uuid_content_hash(value)
+                if digest:
+                    return f"image:hash:{digest}", "uuid-hash"
+                if cls._is_stable_local_identity(value, field):
+                    digest = hashlib.sha256(value.encode()).hexdigest()
+                    return f"image:parsed-{field}:{digest}", f"parsed-{field}"
 
         for value in (raw["file_unique"], parsed["file_unique"]):
             if not value:
@@ -513,30 +510,45 @@ class RepeatPlugin(Star):
             digest = hashlib.sha256(value.encode()).hexdigest()
             return f"image:unique:{digest}", "file-unique"
 
-        identity_values = []
-        for values in (parsed, raw):
-            identity_values.extend(
-                (
-                    (
-                        values["file"]
-                        if not values["file"].lower().startswith(
-                            ("http://", "https://")
-                        )
-                        else ""
-                    ),
-                    values["path"],
-                )
-            )
-        for value in identity_values:
-            digest = cls._terminal_content_hash(value)
-            if digest:
-                return f"image:hash:{digest}", "terminal-hash"
-        for value in identity_values:
-            digest = cls._uuid_content_hash(value)
-            if digest:
-                return f"image:hash:{digest}", "uuid-hash"
+        if not isinstance(candidate.component, Image):
+            for field in ("file", "path"):
+                value = raw[field]
+                if not value:
+                    continue
+                digest = cls._terminal_content_hash(value)
+                if digest:
+                    return f"image:hash:{digest}", "terminal-hash"
+                digest = cls._uuid_content_hash(value)
+                if digest:
+                    return f"image:hash:{digest}", "uuid-hash"
+                if cls._is_stable_local_identity(value, field):
+                    digest = hashlib.sha256(value.encode()).hexdigest()
+                    return f"image:raw-{field}:{digest}", f"raw-{field}"
 
         return None
+
+    @classmethod
+    def _is_stable_local_identity(cls, value: str, field: str) -> bool:
+        text = cls._clean_value(value)
+        lowered = text.lower()
+        if not text or len(text) > 260:
+            return False
+        if re.match(r"^[a-z][a-z0-9+.-]*://", lowered):
+            return False
+        if lowered.startswith(("base64://", "data:")) or any(
+            marker in lowered
+            for marker in ("token", "opaque", "temporary", "rkey", "fileid")
+        ):
+            return False
+        compact = re.sub(r"[^a-zA-Z0-9]", "", text)
+        if len(compact) >= 48 and len(compact) / max(len(text), 1) > 0.85:
+            return False
+        if field == "path":
+            return True
+        return bool(
+            re.search(r"[\\/]", text)
+            or re.search(r"\.[a-zA-Z0-9]{1,10}$", text)
+        )
 
     @classmethod
     def _image_source_entries(cls, candidate: _RepeatCandidate):
@@ -560,9 +572,11 @@ class RepeatPlugin(Star):
         if isinstance(candidate.component, Image):
             parsed = cls._parsed_image_values(candidate)
             component_source = parsed["url"] or parsed["file"]
-            material = f"parsed-component:{component_source}"
+            material = f"{candidate.kind}:parsed-component:{component_source}"
             if not component_source:
-                material = f"parsed-component:{id(candidate.component)}"
+                material = (
+                    f"{candidate.kind}:parsed-component:{id(candidate.component)}"
+                )
             entries.append(
                 ("parsed-component", candidate.component, material)
             )
@@ -574,7 +588,9 @@ class RepeatPlugin(Star):
             seen_sources.add(source)
             probe = cls._image_from_source(field, source)
             if probe is not None:
-                entries.append((label, probe, f"{label}:{source}"))
+                entries.append(
+                    (label, probe, f"{candidate.kind}:{label}:{source}")
+                )
         return entries
 
     @classmethod
