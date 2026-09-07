@@ -117,7 +117,8 @@ class Image:
     async def convert_to_base64(self):
         """Record the source the aiocqhttp adapter would try to convert."""
         self.convert_calls += 1
-        self.converted_source = self.url or self.path or self.file
+        # Mirrors AstrBot Image.convert_to_base64(): it resolves url or file.
+        self.converted_source = self.url or self.file
         if self.converted_source in self.conversion_failures:
             raise RuntimeError("image probe failed")
         if self.converted_source in self.conversion_payloads:

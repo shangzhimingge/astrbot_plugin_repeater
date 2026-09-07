@@ -66,9 +66,9 @@ OneBot 群成员角色，BOT 主人身份使用 AstrBot 管理员配置判定。
 - 同一连续有效消息段成功复读后不再累计；插入不同有效消息会开始新段，因此之后相同消息可重新达到阈值并触发；
 - 冷却期内发送者不计数，但不同有效消息仍会切换消息段；冷却结束后的第一条消息只计 1 人；
 - 发送成功后才提交「本段已复读」和冷却时间；发送异常会记录日志，下一条相同消息可重试；
-- 静态图片优先使用 `file_unique`、文件末尾 32/64 位哈希或 UUID 判重；URL 只移除易失的 `rkey` 并排序查询参数，仍保留 `fileid`、`appid` 等参数，但仅含内容哈希或稳定 `fileid` 时才直接作为身份；
+- 静态图片优先使用含内容哈希/稳定 `fileid` 的 URL 或 `file_unique`，再回退到文件末尾 32/64 位哈希或 UUID；因此 raw 消息级长 token 的尾哈希不会遮蔽更明确的稳定 URL 身份；URL 只移除易失的 `rkey` 并排序查询参数，仍保留 `fileid`、`appid` 等区分参数；
 - 普通动态 URL 和其他弱身份图片会经 AstrBot 转成 Base64，统一解析 bare Base64、`base64://` 与 Data URI，按解码后的真实字节计算 SHA-256；内存缓存最多 128 项、约 5 分钟过期，不保存图片正文；
-- 图片身份与发送来源分开处理：强身份可来自 raw 或 parsed 字段；发送与弱身份转换依次尝试 parsed 图片组件、parsed/raw 的 `url`、`path`、`file`，单个来源失败会继续尝试后续来源，避免 raw 消息级弱 token 遮蔽 AstrBot 已解析出的有效来源；
+- 图片身份与发送来源分开处理：强身份可来自 raw 或 parsed 字段；发送与弱身份转换依次尝试 parsed 图片组件、parsed/raw 的 `url`、`path`、`file`，其中 parsed 组件按 AstrBot 的真实 `url or file` 语义处理，`path` 始终保留为独立回退；单个来源失败会用完整消息链继续尝试后续来源，首次成功即停止；
 - 复读图片会新建发送组件；已经取得 Base64 时直接使用规范化 Base64 图片组件，避免复用 NapCat 入站消息级长 token；
 - 商城动画表情只要存在 `emoji_id` 就以该 ID 判重，缺失时才使用 `key` 的 SHA-256；旧版 `mface` 优先经 OneBot 原生接口直发，仅在接口缺失且存在 GIF URL 时按图片发送；
 - **复读消息是直接发送的**：即使 AstrBot 开启了「回复时引用发送人消息 / 回复时 @ 用户」，复读时也**不会**引用或 @ 最后一位发送者，保证纯复读效果（普通 LLM 回复的引用/@ 不受影响）。
@@ -88,7 +88,7 @@ A：不会。按「不同的人」计数，同一个人重复发只算 1 人。
 A：NapCat 的入站 `file` 可能是每条消息都不同的长 token。插件会优先读取 OneBot 的 `file_unique` 或图片内容哈希作为身份，并另选可发送的 URL/本地路径重建图片组件。
 
 **Q：如何排查媒体为什么没有计数或发送？**
-A：临时开启 `media_diagnostics`，在 Info 日志中检索 `[repeater.media]`；关闭时这些轨迹只进入 Debug。正常处理和跳过路径会记录内部媒体类型、raw/parsed 候选来源、判重策略或跳过原因、指纹短摘要、计数、阈值、处理结果、发送通道和异常类型；日志不记录 URL、路径、`rkey`、商城表情 `key`、Base64、完整 token、正文、Face ID、群号或用户号。
+A：临时开启 `media_diagnostics`，在 Info 日志中检索 `[repeater.media]`；关闭时这些轨迹只进入 Debug。正常处理和跳过路径会记录白名单化的 raw/parsed 消息类型摘要、判重策略或跳过原因、指纹短摘要、计数、实际阈值、处理结果、发送通道和异常类型；未知消息段统一显示为 `other`。日志不记录 URL、路径、`rkey`、商城表情 `key`、Base64、完整 token、正文、Face ID、群号或用户号。
 
 **Q：想支持其他平台（如 QQ 官方、Telegram）？**
 A：删除 `main.py` 中 `on_group_message` 上方的 `@filter.platform_adapter_type(...)` 一行即可（保留群聊过滤即可）。

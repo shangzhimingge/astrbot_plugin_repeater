@@ -48,6 +48,7 @@ class FakeEvent:
         self.message_str = text
         self._messages = list(messages if messages is not None else [Plain(text)])
         self.sent = []
+        self.send_attempts = []
         self._send_hook = send_hook
         self.bot = bot
 
@@ -55,6 +56,7 @@ class FakeEvent:
         return self._messages
 
     async def send(self, chain):
+        self.send_attempts.append(tuple(chain))
         if self._send_hook:
             await self._send_hook()
         for component in chain:
@@ -816,6 +818,144 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(trigger.sent), 1)
         self.assertEqual(trigger.sent[0].base64_data, encoded("fallback-bytes"))
 
+    async def test_parsed_path_remains_a_probe_after_component_file_fails(self):
+        plugin = make_plugin()
+        weak_file = "message-level-weak-token"
+        good_path = "C:/cache/real-image-path.bin"
+        Image.conversion_failures.add(weak_file)
+        Image.conversion_payloads[good_path] = encoded("real-path-bytes")
+
+        async def put(sender, now):
+            image = Image(file=weak_file, path=good_path)
+            return await deliver(
+                plugin, "g", sender, "", now, messages=[image]
+            )
+
+        await put("u1", 1)
+        trigger = await put("u2", 2)
+
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertEqual(trigger.sent[0].base64_data, encoded("real-path-bytes"))
+
+    async def test_strong_image_send_falls_back_across_outbound_sources(self):
+        plugin = make_plugin()
+        bad_url = "https://parsed.test/broken?fileid=stable-image"
+        good_url = "https://raw.test/working?fileid=stable-image"
+        Image.conversion_failures.add(bad_url)
+        raw = raw_event(
+            raw_segment("face", id="339"),
+            raw_segment(
+                "image",
+                file="raw-token",
+                url=good_url,
+                file_unique="stable-file-unique",
+            ),
+        )
+
+        async def put(sender, now):
+            return await deliver(
+                plugin,
+                "g",
+                sender,
+                "",
+                now,
+                messages=[Face(339), Image(file="parsed-token", url=bad_url)],
+                raw_message=raw,
+            )
+
+        await put("u1", 1)
+        trigger = await put("u2", 2)
+
+        self.assertEqual(len(trigger.send_attempts), 2)
+        self.assertEqual(
+            [attempt[1].converted_source for attempt in trigger.send_attempts],
+            [bad_url, good_url],
+        )
+        self.assertEqual(sent_values(trigger), [
+            ("face", 339),
+            ("image", good_url, good_url, None),
+        ])
+        self.assertTrue(plugin._groups["g"].repeated_in_segment)
+        self.assertEqual(plugin._groups["g"].last_repeat_time, 2)
+
+    async def test_stable_fileid_outranks_conflicting_raw_token_hashes(self):
+        first_hash = "1" * 32
+        second_hash = "2" * 32
+
+        async def put(plugin, sender, now, raw_hash, fileid):
+            url = f"https://cdn.test/image?fileid={fileid}&rkey=secret-{now}"
+            raw = raw_event(raw_segment(
+                "image", file=f"token/{raw_hash}.jpg", url=url
+            ))
+            return await deliver(
+                plugin,
+                "g",
+                sender,
+                "",
+                now,
+                messages=[Image(file="parsed-token", url=url)],
+                raw_message=raw,
+            )
+
+        same = make_plugin()
+        await put(same, "u1", 1, first_hash, "same-file")
+        trigger = await put(same, "u2", 2, second_hash, "same-file")
+        self.assertEqual(len(trigger.sent), 1)
+
+        different = make_plugin()
+        await put(different, "u1", 1, first_hash, "file-a")
+        no_trigger = await put(different, "u2", 2, first_hash, "file-b")
+        trigger_b = await put(different, "u3", 3, second_hash, "file-b")
+        self.assertEqual(no_trigger.sent, [])
+        self.assertEqual(len(trigger_b.sent), 1)
+
+    async def test_info_diagnostics_whitelist_raw_and_parsed_type_summaries(self):
+        plugin = make_plugin(threshold=7, media_diagnostics=True)
+        invalid_chain = raw_event(
+            raw_segment("face", id="339"),
+            raw_segment(
+                "image", file="secret-token", url="https://secret.test/a"
+            ),
+            raw_segment("text", text="secret-caption"),
+        )
+        unknown_chain = raw_event(
+            raw_segment("image", file="secret-token-two"),
+            raw_segment("private-segment", payload="secret-payload"),
+        )
+
+        await deliver(
+            plugin, "secret-group", "secret-user", "", 1,
+            messages=[], raw_message=invalid_chain,
+        )
+        await deliver(
+            plugin, "secret-group", "secret-user", "", 2,
+            messages=[], raw_message=unknown_chain,
+        )
+        state = plugin._get_group("stateful-group")
+        state.threshold = 9
+        await deliver(
+            plugin,
+            "stateful-group",
+            "stateful-user",
+            "",
+            3,
+            messages=[Image(file="parsed-only", base64_data=encoded("body"))],
+        )
+
+        info = rendered_infos()
+        self.assertIn("raw_types=face,image,text", info)
+        self.assertIn("raw_types=image,other", info)
+        self.assertIn("parsed_types=none", info)
+        self.assertIn("raw_types=none parsed_types=image", info)
+        self.assertIn("threshold=7", info)
+        self.assertIn("threshold=9", info)
+        for secret in (
+            "339", "secret-token", "https://secret.test", "secret-caption",
+            "private-segment", "secret-payload", "secret-group",
+            "secret-user", "stateful-group", "stateful-user", encoded("body"),
+        ):
+            self.assertNotIn(secret, info)
+
     async def test_media_diagnostics_promotes_redacted_trace_to_info(self):
         raw = raw_event(
             raw_segment("face", id="987654321"),
@@ -1335,6 +1475,9 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_weak_path_is_rebuilt_before_content_digest(self):
         plugin = make_plugin()
         path_content = encoded("/tmp/no-hash.png")
+        Image.conversion_failures.update(
+            {"message-token-one", "message-token-two"}
+        )
         first = Image(file="message-token-one", path="/tmp/no-hash.png")
         triggering = Image(
             file="message-token-two",
