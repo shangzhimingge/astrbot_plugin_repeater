@@ -75,6 +75,11 @@ class _ChainPart:
     value: str = ""
     media_index: int = -1
 
+
+class _MediaLimitError(ValueError):
+    pass
+
+
 @dataclass(slots=True)
 class _RepeatCandidate:
     kind: str
@@ -96,6 +101,7 @@ class _RepeatCandidate:
     parsed_types: str = "none"
     parts: tuple[_ChainPart, ...] = ()
     media: tuple["_RepeatCandidate", ...] = ()
+    content_size: int | None = None
 
 
 class _GroupState:
@@ -408,18 +414,17 @@ class RepeatPlugin(Star):
             ):
                 continue
             try:
-                decoded, _ = cls._decode_base64_content(text)
+                size = cls._estimated_base64_size(text)
             except Exception:
                 continue
-            if decoded:
-                return len(decoded)
+            if size:
+                return size
         return None
 
     @classmethod
     def _match_parsed_images(cls, media, parsed_images):
         unmatched = set(range(len(parsed_images)))
-        ambiguous = set()
-        for media_index, item in enumerate(media):
+        for item in media:
             if item.kind != "image":
                 continue
             raw_values = cls._raw_image_values(item)
@@ -439,17 +444,14 @@ class RepeatPlugin(Star):
                 chosen = matches[0]
                 item.component = parsed_images[chosen]
                 unmatched.remove(chosen)
-            elif len(matches) > 1:
-                ambiguous.add(media_index)
-
         remaining_media = [
             item
-            for index, item in enumerate(media)
-            if item.kind == "image" and item.component is None and index not in ambiguous
+            for item in media
+            if item.kind == "image" and item.component is None
         ]
-        for item, parsed_index in zip(remaining_media, sorted(unmatched)):
-            item.component = parsed_images[parsed_index]
-            unmatched.remove(parsed_index)
+        if len(remaining_media) == len(unmatched):
+            for item, parsed_index in zip(remaining_media, sorted(unmatched)):
+                item.component = parsed_images[parsed_index]
 
     @classmethod
     def _parsed_image_component_values(cls, component):
@@ -481,23 +483,26 @@ class RepeatPlugin(Star):
     ):
         total_image_bytes = 0
         for media in candidate.media:
-            resolved = await self._resolve_media_candidate(event, media, now)
+            remaining_image_bytes = _MAX_TOTAL_IMAGE_BYTES - total_image_bytes
+            if media.kind == "image" and remaining_image_bytes <= 0:
+                candidate.reason = "total-image-size-limit"
+                candidate.strategy = "chain-size-check"
+                return None
+            resolved = await self._resolve_media_candidate(
+                event,
+                media,
+                now,
+                remaining_image_bytes=(
+                    remaining_image_bytes if media.kind == "image" else None
+                ),
+            )
             if resolved is None:
                 candidate.strategy = media.strategy
                 candidate.reason = media.reason
                 candidate.error_type = media.error_type
                 return None
-            if media.kind == "image" and media.content_base64:
-                decoded, _ = self._decode_base64_content(media.content_base64)
-                if len(decoded) > _MAX_IMAGE_BYTES:
-                    candidate.reason = "image-size-limit"
-                    candidate.strategy = "chain-size-check"
-                    return None
-                total_image_bytes += len(decoded)
-        if total_image_bytes > _MAX_TOTAL_IMAGE_BYTES:
-            candidate.reason = "total-image-size-limit"
-            candidate.strategy = "chain-size-check"
-            return None
+            if media.kind == "image" and media.content_size is not None:
+                total_image_bytes += media.content_size
 
         if any(media.kind == "mface" for media in candidate.media):
             bot = getattr(event, "bot", None)
@@ -527,7 +532,11 @@ class RepeatPlugin(Star):
         return candidate
 
     async def _resolve_media_candidate(
-        self, event: AstrMessageEvent, candidate: _RepeatCandidate, now: float
+        self,
+        event: AstrMessageEvent,
+        candidate: _RepeatCandidate,
+        now: float,
+        remaining_image_bytes: int | None = None,
     ):
         if candidate.fingerprint:
             return candidate
@@ -573,6 +582,18 @@ class RepeatPlugin(Star):
         for index, (label, probe) in enumerate(probe_entries):
             try:
                 base64_data = await probe.convert_to_base64()
+                estimated_size = self._estimated_base64_size(base64_data)
+                if estimated_size > _MAX_IMAGE_BYTES:
+                    candidate.strategy = "content-size-check"
+                    candidate.reason = "image-size-limit"
+                    return None
+                if (
+                    remaining_image_bytes is not None
+                    and estimated_size > remaining_image_bytes
+                ):
+                    candidate.strategy = "content-size-check"
+                    candidate.reason = "total-image-size-limit"
+                    return None
                 content_bytes, base64_text = self._decode_base64_content(
                     base64_data
                 )
@@ -586,6 +607,7 @@ class RepeatPlugin(Star):
             candidate.fingerprint = f"image:content:{digest}"
             candidate.strategy = f"content-sha256-{label}"
             candidate.content_base64 = base64_text
+            candidate.content_size = len(content_bytes)
             candidate.outbound = self._image_from_base64(base64_text)
             candidate.probe = probe
             candidate.probes = tuple(
@@ -893,7 +915,7 @@ class RepeatPlugin(Star):
         )
 
     @staticmethod
-    def _decode_base64_content(value):
+    def _base64_payload(value) -> str:
         if isinstance(value, bytes):
             text = value.decode("ascii")
         else:
@@ -906,7 +928,24 @@ class RepeatPlugin(Star):
                 raise ValueError("invalid data URI")
         elif lowered.startswith("base64://"):
             text = text[len("base64://") :]
-        text = re.sub(r"\s+", "", text)
+        return re.sub(r"\s+", "", text)
+
+    @classmethod
+    def _estimated_base64_size(cls, value) -> int:
+        text = cls._base64_payload(value)
+        if not text:
+            return 0
+        if len(text) % 4 == 1:
+            raise ValueError("invalid Base64 length")
+        padded = text + "=" * (-len(text) % 4)
+        padding = len(padded) - len(padded.rstrip("="))
+        if padding > 2 or "=" in padded[:-padding or None]:
+            raise ValueError("invalid Base64 padding")
+        return len(padded) // 4 * 3 - padding
+
+    @classmethod
+    def _decode_base64_content(cls, value):
+        text = cls._base64_payload(value)
         if not text:
             return b"", ""
         padded = text + "=" * (-len(text) % 4)
@@ -982,12 +1021,13 @@ class RepeatPlugin(Star):
         for index, media in enumerate(candidate.media):
             if media.kind != "image":
                 continue
-            outbound, size = await self._materialize_image(media)
-            if size > _MAX_IMAGE_BYTES:
-                raise ValueError("image-size-limit")
-            total_image_bytes += size
-            if total_image_bytes > _MAX_TOTAL_IMAGE_BYTES:
+            remaining_image_bytes = _MAX_TOTAL_IMAGE_BYTES - total_image_bytes
+            if remaining_image_bytes <= 0:
                 raise ValueError("total-image-size-limit")
+            outbound, size = await self._materialize_image(
+                media, remaining_image_bytes
+            )
+            total_image_bytes += size
             materialized[index] = outbound
 
         if candidate.channel in ("send_group_msg", "call_action"):
@@ -1007,18 +1047,25 @@ class RepeatPlugin(Star):
         chain = self._event_message_chain(candidate, materialized)
         await event.send(chain)
 
-    async def _materialize_image(self, media: _RepeatCandidate):
+    async def _materialize_image(
+        self, media: _RepeatCandidate, remaining_image_bytes: int
+    ):
         if media.content_base64:
-            content, canonical = self._decode_base64_content(
-                media.content_base64
-            )
-            return self._image_from_base64(canonical), len(content)
+            size = media.content_size
+            if size is None:
+                size = self._estimated_base64_size(media.content_base64)
+            self._check_image_size(size, remaining_image_bytes)
+            return self._image_from_base64(media.content_base64), size
 
         last_error = None
         for _, probe in self._image_probe_candidates(media):
             try:
                 base64_data = await probe.convert_to_base64()
+                size = self._estimated_base64_size(base64_data)
+                self._check_image_size(size, remaining_image_bytes)
                 content, canonical = self._decode_base64_content(base64_data)
+            except _MediaLimitError:
+                raise
             except Exception as e:
                 last_error = e
                 continue
@@ -1027,6 +1074,13 @@ class RepeatPlugin(Star):
         if last_error is not None:
             raise last_error
         raise ValueError("empty image content")
+
+    @staticmethod
+    def _check_image_size(size: int, remaining_image_bytes: int) -> None:
+        if size > _MAX_IMAGE_BYTES:
+            raise _MediaLimitError("image-size-limit")
+        if size > remaining_image_bytes:
+            raise _MediaLimitError("total-image-size-limit")
 
     @classmethod
     def _event_message_chain(cls, candidate, materialized):

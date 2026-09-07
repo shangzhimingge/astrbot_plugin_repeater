@@ -7,6 +7,7 @@ import hashlib
 import unittest
 from collections import OrderedDict
 from types import SimpleNamespace
+from unittest import mock
 
 from tests._astrbot_stubs import At, Face, Image, Plain, Reply, install
 
@@ -985,6 +986,70 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         changed = await put("u3", 3, "three", (encoded("B"), encoded("A")))
         self.assertEqual(changed.sent, [])
 
+    async def test_partial_parsed_images_do_not_shift_raw_image_sources(self):
+        plugin = make_plugin()
+        raw = raw_event(
+            raw_segment("image", file="raw-a"),
+            raw_segment("image", file="raw-b"),
+        )
+        Image.conversion_payloads.update({
+            "raw-a": encoded("A"),
+            "raw-b": encoded("B"),
+        })
+
+        async def put(sender, now):
+            return await deliver(
+                plugin,
+                "g",
+                sender,
+                "",
+                now,
+                messages=[Image(file="parsed-only-b", base64_data=encoded("B"))],
+                raw_message=raw,
+            )
+
+        await put("u1", 1)
+        trigger = await put("u2", 2)
+
+        self.assertEqual(
+            [item.base64_data for item in trigger.sent],
+            [encoded("A"), encoded("B")],
+        )
+
+    async def test_ambiguous_duplicate_image_matches_fall_back_by_order(self):
+        plugin = make_plugin()
+        raw = raw_event(
+            raw_segment("image", file="raw-a", file_unique="duplicate"),
+            raw_segment("image", file="raw-b", file_unique="duplicate"),
+        )
+        Image.conversion_failures.update({"raw-a", "raw-b"})
+
+        def parsed():
+            return [
+                Image(
+                    file="parsed-a",
+                    file_unique="duplicate",
+                    base64_data=encoded("A"),
+                ),
+                Image(
+                    file="parsed-b",
+                    file_unique="duplicate",
+                    base64_data=encoded("B"),
+                ),
+            ]
+
+        await deliver(
+            plugin, "g", "u1", "", 1, messages=parsed(), raw_message=raw
+        )
+        trigger = await deliver(
+            plugin, "g", "u2", "", 2, messages=parsed(), raw_message=raw
+        )
+
+        self.assertEqual(
+            [item.base64_data for item in trigger.sent],
+            [encoded("A"), encoded("B")],
+        )
+
     async def test_auxiliary_segments_are_removed_from_composite_identity(self):
         plugin = make_plugin()
         first_raw = raw_event(
@@ -1208,6 +1273,60 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([image.convert_calls for image in images], [0, 0, 0])
         self.assertEqual(total._groups, {})
         self.assertIn("reason=total-image-size-limit", rendered_infos())
+
+    async def test_unknown_image_sizes_stop_probing_after_total_limit(self):
+        plugin = make_plugin(media_diagnostics=True)
+        images = [Image(file=f"source-{index}") for index in range(4)]
+        for image in images:
+            Image.conversion_payloads[image.file] = encoded(b"x" * 8)
+
+        with (
+            mock.patch.object(main, "_MAX_IMAGE_BYTES", 10),
+            mock.patch.object(main, "_MAX_TOTAL_IMAGE_BYTES", 20),
+        ):
+            await deliver(
+                plugin,
+                "g",
+                "u",
+                "",
+                1,
+                messages=images,
+                raw_message=raw_event(
+                    *(raw_segment("image", file=image.file) for image in images)
+                ),
+            )
+
+        self.assertEqual([image.convert_calls for image in images], [1, 1, 1, 0])
+        self.assertIsNone(plugin._groups["g"].current_fingerprint)
+        self.assertEqual(plugin._groups["g"].senders, set())
+        self.assertIn("reason=total-image-size-limit", rendered_infos())
+
+    async def test_base64_size_limit_is_checked_before_decode(self):
+        plugin = make_plugin(media_diagnostics=True)
+        image = Image(file="too-large", base64_data=encoded(b"x" * 11))
+
+        with (
+            mock.patch.object(main, "_MAX_IMAGE_BYTES", 10),
+            mock.patch.object(main, "_MAX_TOTAL_IMAGE_BYTES", 20),
+            mock.patch.object(
+                main.base64,
+                "b64decode",
+                side_effect=AssertionError("base64 decoded before size check"),
+            ),
+        ):
+            await deliver(
+                plugin,
+                "g",
+                "u",
+                "",
+                1,
+                messages=[image],
+                raw_message=raw_event(raw_segment("image", file="raw")),
+            )
+
+        self.assertEqual(plugin._groups, {})
+        self.assertEqual(image.convert_calls, 0)
+        self.assertIn("reason=image-size-limit", rendered_infos())
 
     async def test_captioned_image_send_failure_retries_same_content(self):
         plugin = make_plugin()
