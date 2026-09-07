@@ -15,7 +15,6 @@ import json
 import os
 import re
 import time
-from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,10 +58,6 @@ _PERMISSION_LABEL = {
     "owner": "群主",
     "bot_owner": "BOT主人",
 }
-
-_MEDIA_CACHE_LIMIT = 128
-_MEDIA_CACHE_TTL = 300.0
-
 
 @dataclass(slots=True)
 class _RepeatCandidate:
@@ -117,9 +112,6 @@ class RepeatPlugin(Star):
         super().__init__(context)
         self.config = config
         self._groups: dict[str, _GroupState] = {}
-        self._media_digest_cache: OrderedDict[
-            str, tuple[float, str]
-        ] = OrderedDict()
         self._state_file = self._data_dir() / "state.json"
         self._load_state()
         logger.info("复读机插件已加载，群状态数据文件: %s", self._state_file)
@@ -401,23 +393,8 @@ class RepeatPlugin(Star):
             candidate.strategy = "missing-image-source"
             candidate.reason = "missing-source"
             return None
-        cache = self._media_cache()
         saw_probe_error = False
-        for index, (label, probe, cache_material) in enumerate(probe_entries):
-            cache_key = hashlib.sha256(cache_material.encode()).hexdigest()
-            cached = cache.get(cache_key)
-            if cached is not None:
-                cached_at, digest = cached
-                if now - cached_at <= _MEDIA_CACHE_TTL:
-                    cache.move_to_end(cache_key)
-                    candidate.fingerprint = f"image:content:{digest}"
-                    candidate.strategy = f"content-cache-{label}"
-                    candidate.probe = probe
-                    candidate.probes = tuple(
-                        item[1] for item in probe_entries[index:]
-                    )
-                    return self._apply_image_chain_fingerprint(candidate)
-                cache.pop(cache_key, None)
+        for index, (label, probe) in enumerate(probe_entries):
             try:
                 base64_data = await probe.convert_to_base64()
                 content_bytes, base64_text = self._decode_base64_content(
@@ -430,10 +407,6 @@ class RepeatPlugin(Star):
             if not content_bytes:
                 continue
             digest = hashlib.sha256(content_bytes).hexdigest()
-            cache[cache_key] = (now, digest)
-            cache.move_to_end(cache_key)
-            while len(cache) > _MEDIA_CACHE_LIMIT:
-                cache.popitem(last=False)
             candidate.fingerprint = f"image:content:{digest}"
             candidate.strategy = f"content-sha256-{label}"
             candidate.content_base64 = base64_text
@@ -443,6 +416,19 @@ class RepeatPlugin(Star):
                 item[1] for item in probe_entries[index:]
             )
             return self._apply_image_chain_fingerprint(candidate)
+
+        fallback = self._fallback_image_identity(candidate)
+        if fallback is not None:
+            candidate.fingerprint, candidate.strategy = fallback
+            candidate.outbounds = self._image_outbound_candidates(candidate)
+            candidate.outbound = (
+                candidate.outbounds[0] if candidate.outbounds else None
+            )
+            if candidate.outbounds:
+                return self._apply_image_chain_fingerprint(candidate)
+            candidate.reason = "missing-source"
+            return None
+
         candidate.strategy = "probe-exhausted"
         candidate.reason = "probe-failed" if saw_probe_error else "empty-content"
         return None
@@ -486,21 +472,6 @@ class RepeatPlugin(Star):
         raw = cls._raw_image_values(candidate)
         parsed = cls._parsed_image_values(candidate)
 
-        if isinstance(candidate.component, Image):
-            for field in ("file", "url", "path"):
-                value = parsed[field]
-                if field == "url" or not value:
-                    continue
-                digest = cls._terminal_content_hash(value)
-                if digest:
-                    return f"image:hash:{digest}", "terminal-hash"
-                digest = cls._uuid_content_hash(value)
-                if digest:
-                    return f"image:hash:{digest}", "uuid-hash"
-                if cls._is_stable_local_identity(value, field):
-                    digest = hashlib.sha256(value.encode()).hexdigest()
-                    return f"image:parsed-{field}:{digest}", f"parsed-{field}"
-
         for value in (raw["file_unique"], parsed["file_unique"]):
             if not value:
                 continue
@@ -510,22 +481,43 @@ class RepeatPlugin(Star):
             digest = hashlib.sha256(value.encode()).hexdigest()
             return f"image:unique:{digest}", "file-unique"
 
-        if not isinstance(candidate.component, Image):
-            for field in ("file", "path"):
-                value = raw[field]
-                if not value:
-                    continue
-                digest = cls._terminal_content_hash(value)
-                if digest:
-                    return f"image:hash:{digest}", "terminal-hash"
-                digest = cls._uuid_content_hash(value)
-                if digest:
-                    return f"image:hash:{digest}", "uuid-hash"
-                if cls._is_stable_local_identity(value, field):
-                    digest = hashlib.sha256(value.encode()).hexdigest()
-                    return f"image:raw-{field}:{digest}", f"raw-{field}"
+        values = parsed if isinstance(candidate.component, Image) else raw
+        for field in ("file", "url", "path"):
+            value = values[field]
+            if not value or cls._requires_content_probe(value):
+                continue
+            digest = cls._terminal_content_hash(value)
+            if digest:
+                return f"image:hash:{digest}", "terminal-hash"
+            digest = cls._uuid_content_hash(value)
+            if digest:
+                return f"image:hash:{digest}", "uuid-hash"
 
         return None
+
+    @classmethod
+    def _fallback_image_identity(cls, candidate: _RepeatCandidate):
+        parsed_image = isinstance(candidate.component, Image)
+        values = (
+            cls._parsed_image_values(candidate)
+            if parsed_image
+            else cls._raw_image_values(candidate)
+        )
+        scope = "parsed" if parsed_image else "raw"
+        for field in ("file", "url", "path"):
+            value = values[field]
+            if field == "url" or not cls._is_stable_local_identity(value, field):
+                continue
+            digest = hashlib.sha256(value.encode()).hexdigest()
+            return f"image:{scope}-{field}:{digest}", f"fallback-{scope}-{field}"
+        return None
+
+    @classmethod
+    def _requires_content_probe(cls, value: str) -> bool:
+        lowered = cls._clean_value(value).lower()
+        return lowered.startswith(
+            ("http://", "https://", "base64://", "data:")
+        )
 
     @classmethod
     def _is_stable_local_identity(cls, value: str, field: str) -> bool:
@@ -569,28 +561,31 @@ class RepeatPlugin(Star):
     def _image_probe_candidates(cls, candidate: _RepeatCandidate):
         entries = []
         seen_sources = set()
+        parsed = cls._parsed_image_values(candidate)
+        raw = cls._raw_image_values(candidate)
         if isinstance(candidate.component, Image):
-            parsed = cls._parsed_image_values(candidate)
             component_source = parsed["url"] or parsed["file"]
-            material = f"{candidate.kind}:parsed-component:{component_source}"
-            if not component_source:
-                material = (
-                    f"{candidate.kind}:parsed-component:{id(candidate.component)}"
-                )
-            entries.append(
-                ("parsed-component", candidate.component, material)
-            )
             if component_source:
+                entries.append(("parsed-component", candidate.component))
                 seen_sources.add(component_source)
-        for label, field, source in cls._image_source_entries(candidate):
-            if source in seen_sources:
-                continue
-            seen_sources.add(source)
-            probe = cls._image_from_source(field, source)
-            if probe is not None:
-                entries.append(
-                    (label, probe, f"{candidate.kind}:{label}:{source}")
-                )
+        for scope, values, fields in (
+            ("parsed", parsed, ("file", "url", "path")),
+            ("raw", raw, ("url", "path", "file")),
+        ):
+            for field in fields:
+                if scope == "parsed" and field == "file" and parsed["url"]:
+                    # AstrBot converts an existing parsed Image via ``url or
+                    # file``.  Rebuilding its shadowed file as a fresh Image
+                    # would invent a transport path the adapter did not use.
+                    continue
+                source = values[field]
+                if not source or source in seen_sources:
+                    continue
+                seen_sources.add(source)
+                probe = cls._image_from_source(field, source)
+                if probe is not None:
+                    label = f"{scope}-{field}"
+                    entries.append((label, probe))
         return entries
 
     @classmethod
@@ -736,13 +731,6 @@ class RepeatPlugin(Star):
         if callable(from_base64):
             return from_base64(base64_text)
         return Image(file=f"base64://{base64_text}")
-
-    def _media_cache(self):
-        cache = getattr(self, "_media_digest_cache", None)
-        if cache is None:
-            cache = OrderedDict()
-            self._media_digest_cache = cache
-        return cache
 
     @classmethod
     def _resolve_mface_channel(

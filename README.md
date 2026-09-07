@@ -66,9 +66,9 @@ OneBot 群成员角色，BOT 主人身份使用 AstrBot 管理员配置判定。
 - 同一连续有效消息段成功复读后不再累计；插入不同有效消息会开始新段，因此之后相同消息可重新达到阈值并触发；
 - 冷却期内发送者不计数，但不同有效消息仍会切换消息段；冷却结束后的第一条消息只计 1 人；
 - 发送成功后才提交「本段已复读」和冷却时间；发送异常会记录日志，下一条相同消息可重试；
-- 普通图片参考解析后组件语义，按 parsed `file` → `url` → `path` 评估身份：长度受限、非 URL/Base64 且无明显临时 token 结构的 `file` / `path` 直接使用其 SHA-256 摘要；终端 MD5/SHA-256、UUID 和可信 `file_unique` 继续走快速路径；
-- URL（包括会变化的 `fileid` / `rkey`）、Base64、超长或临时 opaque token 不直接充当身份，而是经 AstrBot 转成 Base64，统一解析 bare Base64、`base64://` 与 Data URI，按解码后的真实字节计算 SHA-256；相同图片字节可跨不同 URL 合并计数，不同字节会切段；
-- raw 字段主要用于识别消息结构与发送来源，仅在 parsed 图片缺失时参与身份兜底；内存摘要缓存最多 128 项、约 5 分钟过期，不保存图片正文；
+- 普通图片参考解析后组件语义，优先从 parsed `file` → `url` → `path` 选择内容探针，再使用 raw 来源回退；可信 `file_unique`、终端 MD5/SHA-256 与 UUID 继续走快速路径；
+- URL（包括会变化的 `fileid` / `rkey`）、Base64、普通文件名、路径、超长或临时 opaque token 均优先经 AstrBot 转成 Base64，统一解析 bare Base64、`base64://` 与 Data URI，按解码后的真实字节计算 SHA-256；相同图片字节可跨文件名或 URL 合并计数，不同字节会切段；
+- 内容探测会逐条重新读取来源，避免同一 URL 或路径在短时间内内容变化时沿用旧摘要；全部探针失败后，仅将确认稳定的短 `file` / `path` 摘要作为保守身份兜底；raw 字段主要用于识别消息结构与发送来源，仅在 parsed 图片缺失时参与身份兜底；
 - 图片身份与发送来源分开处理：强身份可来自 raw 或 parsed 字段；发送与弱身份转换依次尝试 parsed 图片组件、parsed/raw 的 `url`、`path`、`file`，其中 parsed 组件按 AstrBot 的真实 `url or file` 语义处理，`path` 始终保留为独立回退；单个来源失败会用完整消息链继续尝试后续来源，首次成功即停止；
 - 复读图片会新建发送组件；已经取得 Base64 时直接使用规范化 Base64 图片组件，避免复用 NapCat 入站消息级长 token；
 - 商城动画表情只要存在 `emoji_id` 就以该 ID 判重，缺失时才使用 `key` 的 SHA-256；旧版 `mface` 优先经 OneBot 原生接口直发，仅在接口缺失且存在 GIF URL 时按图片发送；
@@ -86,7 +86,7 @@ A：AstrBot 的「回复时引用发送人消息 / 回复时 @ 用户」是在�
 A：不会。按「不同的人」计数，同一个人重复发只算 1 人。
 
 **Q：同一张图片为什么可以稳定触发复读？**
-A：NapCat 的 raw `file` / `fileid` 可能逐条变化。插件优先采用 AstrBot parsed 图片中的稳定短 `file` / `path`；遇到 URL、Base64 或临时 token 时按真实图片字节判重，并另选可发送来源重建图片组件。
+A：NapCat 的 raw `file` / `fileid` 可能逐条变化。插件优先读取 AstrBot parsed 图片来源并按真实图片字节判重；只有内容探测全部失败时，才保守采用稳定短 `file` / `path`，并另选可发送来源重建图片组件。
 
 **Q：如何排查媒体为什么没有计数或发送？**
 A：临时开启 `media_diagnostics`，在 Info 日志中检索 `[repeater.media]`；关闭时这些轨迹只进入 Debug。正常处理和跳过路径会记录白名单化的 raw/parsed 消息类型摘要、判重策略或跳过原因、指纹短摘要、计数、实际阈值、处理结果、发送通道和异常类型；未知消息段统一显示为 `other`。日志不记录 URL、路径、`rkey`、商城表情 `key`、Base64、完整 token、正文、Face ID、群号或用户号。

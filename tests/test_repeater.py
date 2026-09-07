@@ -399,8 +399,9 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     url="https://example.test/a.png?fileid=stable-a",
                     path="/tmp/not-selected.png",
                 ),
-                "url",
-                "https://example.test/a.png?fileid=stable-a",
+                "base64",
+                "base64://"
+                + encoded("https://example.test/a.png?fileid=stable-a"),
             ),
             (
                 Image(
@@ -825,8 +826,10 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         trigger = await put("u2", 2, "raw-two")
 
         self.assertEqual(len(trigger.sent), 1)
-        self.assertEqual(trigger.sent[0].constructed_by, "path")
-        self.assertEqual(trigger.sent[0].converted_source, good_path)
+        self.assertEqual(trigger.sent[0].constructed_by, "base64")
+        self.assertEqual(
+            trigger.sent[0].base64_data, encoded("fallback-bytes")
+        )
 
     async def test_parsed_path_remains_a_probe_after_component_file_fails(self):
         plugin = make_plugin()
@@ -845,8 +848,10 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         trigger = await put("u2", 2)
 
         self.assertEqual(len(trigger.sent), 1)
-        self.assertEqual(trigger.sent[0].constructed_by, "path")
-        self.assertEqual(trigger.sent[0].converted_source, good_path)
+        self.assertEqual(trigger.sent[0].constructed_by, "base64")
+        self.assertEqual(
+            trigger.sent[0].base64_data, encoded("real-path-bytes")
+        )
 
     async def test_strong_image_send_falls_back_across_outbound_sources(self):
         plugin = make_plugin()
@@ -1381,7 +1386,7 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(trigger.sent), 1)
         self.assertEqual(trigger.sent[0].base64_data, content)
 
-    async def test_parsed_file_identity_ignores_rotating_raw_fileid(self):
+    async def test_parsed_file_content_ignores_rotating_raw_fileid(self):
         plugin = make_plugin()
 
         async def put(sender, now, fileid):
@@ -1404,18 +1409,22 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         trigger = await put("u2", 2, "rotating-two")
 
         self.assertEqual(len(trigger.sent), 1)
-        self.assertIn("parsed-file", plugin._groups["g"].current_fingerprint)
+        expected = hashlib.sha256(b"stable-picture.png").hexdigest()
+        self.assertEqual(
+            plugin._groups["g"].current_fingerprint,
+            f"image:content:{expected}",
+        )
 
-    async def test_short_parsed_file_and_path_outrank_raw_urls(self):
+    async def test_short_parsed_file_and_path_probe_before_raw_urls(self):
         cases = (
-            (lambda: Image(file="stable-relative.png"), "parsed-file"),
+            (lambda: Image(file="stable-relative.png"), b"stable-relative.png"),
             (
                 lambda: Image(file=None, path="C:/pictures/stable-local.png"),
-                "parsed-path",
+                b"C:/pictures/stable-local.png",
             ),
         )
-        for factory, strategy in cases:
-            with self.subTest(strategy=strategy):
+        for factory, content in cases:
+            with self.subTest(content=content):
                 plugin = make_plugin()
 
                 async def put(sender, now):
@@ -1440,7 +1449,88 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 await put("u1", 1)
                 trigger = await put("u2", 2)
                 self.assertEqual(len(trigger.sent), 1)
-                self.assertIn(strategy, plugin._groups["g"].current_fingerprint)
+                expected = hashlib.sha256(content).hexdigest()
+                self.assertEqual(
+                    plugin._groups["g"].current_fingerprint,
+                    f"image:content:{expected}",
+                )
+
+    async def test_parsed_file_url_hashes_content_before_url_tokens(self):
+        same = make_plugin()
+        same_content = encoded("same-file-url-bytes")
+        first = Image(
+            file=(
+                "https://cdn.test/11111111-1111-1111-1111-111111111111.png"
+                "?fileid=first&rkey=one"
+            ),
+            base64_data=same_content,
+        )
+        second = Image(
+            file=(
+                "https://cdn.test/22222222-2222-2222-2222-222222222222.png"
+                "?fileid=second&rkey=two"
+            ),
+            base64_data=same_content,
+        )
+
+        await deliver(same, "g", "u1", "", 1, messages=[first])
+        trigger = await deliver(same, "g", "u2", "", 2, messages=[second])
+
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertEqual(first.convert_calls, 1)
+        self.assertEqual(second.convert_calls, 1)
+
+        different = make_plugin()
+        different_first = Image(
+            file="https://cdn.test/" + "a" * 32 + ".png?rkey=one",
+            base64_data=encoded("file-url-content-a"),
+        )
+        different_second = Image(
+            file="https://cdn.test/" + "b" * 32 + ".png?rkey=two",
+            base64_data=encoded("file-url-content-b"),
+        )
+        await deliver(
+            different, "g", "u1", "", 1, messages=[different_first]
+        )
+        no_trigger = await deliver(
+            different, "g", "u2", "", 2, messages=[different_second]
+        )
+        self.assertEqual(no_trigger.sent, [])
+        self.assertEqual(different_first.convert_calls, 1)
+        self.assertEqual(different_second.convert_calls, 1)
+
+    async def test_same_parsed_filename_uses_bytes_and_file_unique_wins(self):
+        by_content = make_plugin()
+        first = Image(file="same-name.png", base64_data=encoded("content-a"))
+        second = Image(file="same-name.png", base64_data=encoded("content-b"))
+
+        await deliver(by_content, "g", "u1", "", 1, messages=[first])
+        no_trigger = await deliver(
+            by_content, "g", "u2", "", 2, messages=[second]
+        )
+
+        self.assertEqual(no_trigger.sent, [])
+        self.assertEqual(first.convert_calls, 1)
+        self.assertEqual(second.convert_calls, 1)
+
+        by_unique = make_plugin()
+        unique_first = Image(
+            file="same-name.png",
+            file_unique="trusted-unique-a",
+            base64_data=encoded("shared-content"),
+        )
+        unique_second = Image(
+            file="same-name.png",
+            file_unique="trusted-unique-b",
+            base64_data=encoded("shared-content"),
+        )
+        await deliver(by_unique, "g", "u1", "", 1, messages=[unique_first])
+        unique_event = await deliver(
+            by_unique, "g", "u2", "", 2, messages=[unique_second]
+        )
+        self.assertEqual(unique_event.sent, [])
+        self.assertEqual(unique_first.convert_calls, 0)
+        self.assertEqual(unique_second.convert_calls, 0)
 
     async def test_temporary_parsed_tokens_use_content_bytes_for_identity(self):
         token_one = "temporary-message-token-" + "A" * 400
@@ -1487,20 +1577,23 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(no_trigger.sent, [])
 
     async def test_failed_conversion_accepts_only_confirmed_stable_identity(self):
-        stable = make_plugin(threshold=3)
+        stable = make_plugin(threshold=3, media_diagnostics=True)
         stable_file = "confirmed-stable.png"
         Image.conversion_failures.add(stable_file)
+        stable_image = Image(file=stable_file)
         await deliver(
             stable,
             "stable-group",
             "u1",
             "",
             1,
-            messages=[Image(file=stable_file)],
+            messages=[stable_image],
         )
+        self.assertEqual(stable_image.convert_calls, 1)
         self.assertIn(
             "parsed-file", stable._groups["stable-group"].current_fingerprint
         )
+        self.assertIn("strategy=fallback-parsed-file", rendered_infos())
 
         weak = make_plugin(threshold=3, media_diagnostics=True)
         weak_token = "temporary-opaque-token-" + "X" * 400
@@ -1649,40 +1742,25 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(trigger.sent), 1)
-        self.assertEqual(trigger.sent[0].constructed_by, "path")
-        self.assertEqual(trigger.sent[0].converted_source, "/tmp/no-hash.png")
+        self.assertEqual(trigger.sent[0].constructed_by, "base64")
+        self.assertEqual(
+            trigger.sent[0].base64_data, encoded("/tmp/no-hash.png")
+        )
 
-    async def test_media_digest_cache_is_bounded_and_expires(self):
+    async def test_same_source_is_reprobed_when_content_changes(self):
         plugin = make_plugin(threshold=50)
-        cache_content = encoded("cache-content")
-        first = Image(file="opaque-cache", base64_data=cache_content)
-        cached = Image(file="opaque-cache", base64_data=cache_content)
-        expired = Image(file="opaque-cache", base64_data=cache_content)
+        first = Image(file="opaque-cache", base64_data=encoded("content-a"))
+        changed = Image(file="opaque-cache", base64_data=encoded("content-b"))
+        later = Image(file="opaque-cache", base64_data=encoded("content-c"))
 
         await deliver(plugin, "g", "u1", "", 0, messages=[first])
-        await deliver(plugin, "g", "u2", "", 1, messages=[cached])
-        await deliver(plugin, "g", "u3", "", 301, messages=[expired])
+        await deliver(plugin, "g", "u2", "", 1, messages=[changed])
+        await deliver(plugin, "g", "u3", "", 301, messages=[later])
 
         self.assertEqual(first.convert_calls, 1)
-        self.assertEqual(cached.convert_calls, 0)
-        self.assertEqual(expired.convert_calls, 1)
-
-        bounded = make_plugin(threshold=50)
-        for index in range(130):
-            await deliver(
-                bounded,
-                "g",
-                f"u{index}",
-                "",
-                index,
-                messages=[
-                    Image(
-                        file=f"opaque-{index}",
-                        base64_data=encoded(f"content-{index}"),
-                    )
-                ],
-            )
-        self.assertLessEqual(len(bounded._media_digest_cache), 128)
+        self.assertEqual(changed.convert_calls, 1)
+        self.assertEqual(later.convert_calls, 1)
+        self.assertEqual(plugin._media_digest_cache, OrderedDict())
 
     async def test_different_url_queries_share_equal_content_identity(self):
         plugin = make_plugin()
