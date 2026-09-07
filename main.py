@@ -22,7 +22,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Face, Image, Plain
+from astrbot.api.message_components import At, Face, Image, Plain
 from astrbot.api.star import Context, Star
 
 
@@ -59,6 +59,22 @@ _PERMISSION_LABEL = {
     "bot_owner": "BOT主人",
 }
 
+_CHAIN_FINGERPRINT_VERSION = "chain-v1"
+_MAX_RAW_SEGMENTS = 64
+_MAX_MEANINGFUL_PARTS = 32
+_MAX_MEDIA_PARTS = 8
+_MAX_TEXT_CHARS = 4096
+_MAX_AT_PARTS = 8
+_MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+@dataclass(slots=True)
+class _ChainPart:
+    kind: str
+    value: str = ""
+    media_index: int = -1
+
 @dataclass(slots=True)
 class _RepeatCandidate:
     kind: str
@@ -78,6 +94,8 @@ class _RepeatCandidate:
     chain: tuple[tuple[str, str], ...] = ()
     raw_types: str = "none"
     parsed_types: str = "none"
+    parts: tuple[_ChainPart, ...] = ()
+    media: tuple["_RepeatCandidate", ...] = ()
 
 
 class _GroupState:
@@ -156,58 +174,68 @@ class RepeatPlugin(Star):
         return fingerprint
 
     def _extract_candidate(self, event: AstrMessageEvent):
-        """Raw OneBot 媒体优先；没有 raw 媒体时才回退解析后组件。"""
+        """Build a bounded ordered chain; raw OneBot order is authoritative."""
         raw_types, parsed_types = self._message_type_summaries(event)
-        found_raw_media, candidate = self._raw_media_candidate(
-            event, raw_types, parsed_types
+        raw = self._value_of(
+            getattr(event, "message_obj", None), "raw_message"
         )
-        if found_raw_media:
-            if candidate is not None:
-                candidate.raw_types = raw_types
-                candidate.parsed_types = parsed_types
-            return candidate
+        raw_segments = self._value_of(raw, "message")
+        if isinstance(raw_segments, (list, tuple)) and raw_segments:
+            return self._raw_chain_candidate(
+                event, raw_segments, raw_types, parsed_types
+            )
+        return self._parsed_chain_candidate(event, raw_types, parsed_types)
 
+    def _parsed_chain_candidate(
+        self, event: AstrMessageEvent, raw_types: str, parsed_types: str
+    ):
         components = list(event.get_messages() or [])
-        if len(components) != 1:
-            return None
-        component = components[0]
-        if isinstance(component, Plain):
-            text = self._clean_value(getattr(component, "text", None))
-            if not text:
-                return None
-            return _RepeatCandidate(
-                kind="text",
-                source="parsed",
-                component=component,
-                fingerprint=f"text:{text}",
-                strategy="plain",
-                outbound=component,
-                raw_types=raw_types,
-                parsed_types=parsed_types,
+        parts = []
+        media = []
+        self_id = self._clean_value(
+            self._value_of(getattr(event, "message_obj", None), "self_id")
+        )
+        for component in components:
+            name = component.__class__.__name__.lower()
+            if isinstance(component, Plain):
+                raw_text = getattr(component, "text", None)
+                value = "" if raw_text is None else str(raw_text)
+                if value.strip():
+                    parts.append(_ChainPart("text", value))
+                continue
+            if isinstance(component, Face):
+                value = self._clean_value(getattr(component, "id", None))
+                if value:
+                    parts.append(_ChainPart("face", value))
+                    continue
+            elif isinstance(component, Image):
+                media_index = len(media)
+                media.append(
+                    _RepeatCandidate(
+                        kind="image", source="parsed", component=component
+                    )
+                )
+                parts.append(_ChainPart("image", media_index=media_index))
+                continue
+            elif isinstance(component, At):
+                value = self._clean_value(getattr(component, "qq", None))
+                if value and value == self_id:
+                    continue
+                if value:
+                    parts.append(_ChainPart("at", value))
+                    continue
+            elif name == "reply":
+                continue
+            return self._skip_extraction(
+                event,
+                "parsed",
+                "unsupported-segment",
+                raw_types,
+                parsed_types,
             )
-        if isinstance(component, Face):
-            face_id = self._clean_value(getattr(component, "id", None))
-            if not face_id:
-                return None
-            return _RepeatCandidate(
-                kind="face",
-                source="parsed",
-                component=component,
-                fingerprint=f"face:{face_id}",
-                strategy="face-id",
-                outbound=component,
-                raw_types=raw_types,
-                parsed_types=parsed_types,
-            )
-        if isinstance(component, Image):
-            return _RepeatCandidate(
-                kind="image",
-                source="parsed",
-                component=component,
-                raw_types=raw_types,
-                parsed_types=parsed_types,
-            )
-        return None
+        return self._candidate_from_parts(
+            event, "parsed", parts, media, raw_types, parsed_types
+        )
 
     @classmethod
     def _message_type_summaries(cls, event: AstrMessageEvent):
@@ -235,126 +263,270 @@ class RepeatPlugin(Star):
                 parsed_types.append(name if name in allowed else "other")
         return ",".join(raw_types) or "none", ",".join(parsed_types) or "none"
 
-    def _raw_media_candidate(
+    def _raw_chain_candidate(
         self,
         event: AstrMessageEvent,
+        segments,
         raw_types: str,
         parsed_types: str,
     ):
+        if len(segments) > _MAX_RAW_SEGMENTS:
+            return self._skip_extraction(
+                event, "raw", "raw-segment-limit", raw_types, parsed_types
+            )
         raw = self._value_of(
             getattr(event, "message_obj", None), "raw_message"
         )
-        segments = self._value_of(raw, "message")
-        if not isinstance(segments, (list, tuple)):
-            return False, None
-
+        self_id = self._clean_value(
+            self._value_of(getattr(event, "message_obj", None), "self_id")
+            or self._value_of(raw, "self_id")
+        )
+        parts = []
         media = []
         for segment in segments:
             segment_type = self._clean_value(
                 self._value_of(segment, "type")
             ).lower()
-            if segment_type in ("image", "mface"):
-                media.append((segment_type, segment))
-        if not media:
-            return False, None
-        diagnostic_threshold = self._diagnostic_threshold(event)
-        if len(media) != 1:
-            self._debug_skip(
-                "multiple",
-                "raw",
-                "multiple-media",
-                raw_types,
-                parsed_types,
-                diagnostic_threshold,
-            )
-            return True, None
-
-        kind, target_segment = media[0]
-        self_id = self._clean_value(
-            self._value_of(getattr(event, "message_obj", None), "self_id")
-            or self._value_of(raw, "self_id")
-        )
-        chain = []
-        for segment in segments:
-            segment_type = self._clean_value(
-                self._value_of(segment, "type")
-            ).lower()
             data = self._value_of(segment, "data")
-            if segment is target_segment:
-                chain.append(("image", ""))
-                continue
             if segment_type == "reply":
                 continue
             if segment_type == "text":
                 raw_text = self._value_of(data, "text")
-                text_value = "" if raw_text is None else str(raw_text)
-                if not text_value.strip():
+                value = "" if raw_text is None else str(raw_text)
+                if value.strip():
+                    parts.append(_ChainPart("text", value))
+                continue
+            if segment_type == "face":
+                value = self._clean_value(self._value_of(data, "id"))
+                if value:
+                    parts.append(_ChainPart("face", value))
                     continue
-                if kind == "image":
-                    chain.append(("text", text_value))
+            elif segment_type == "at":
+                value = self._clean_value(self._value_of(data, "qq"))
+                if value and value == self_id:
                     continue
-            if segment_type == "text":
-                self._debug_skip(
-                    kind,
-                    "raw",
-                    "nonblank-text",
-                    raw_types,
-                    parsed_types,
-                    diagnostic_threshold,
+                if value:
+                    parts.append(_ChainPart("at", value))
+                    continue
+            elif segment_type in ("image", "mface"):
+                media_index = len(media)
+                media.append(
+                    _RepeatCandidate(
+                        kind=segment_type,
+                        source="raw",
+                        data=data,
+                        channel="mface" if segment_type == "mface" else "event",
+                    )
                 )
-                return True, None
-            if segment_type == "at" and self_id:
-                qq = self._clean_value(self._value_of(data, "qq"))
-                if qq == self_id:
-                    continue
-            if segment_type == "at":
-                self._debug_skip(
-                    kind,
-                    "raw",
-                    "other-at",
-                    raw_types,
-                    parsed_types,
-                    diagnostic_threshold,
+                parts.append(
+                    _ChainPart(segment_type, media_index=media_index)
                 )
-                return True, None
-            if segment_type == "face" and kind == "image":
-                face_id = self._clean_value(self._value_of(data, "id"))
-                if face_id:
-                    chain.append(("face", face_id))
-                    continue
-            self._debug_skip(
-                kind,
+                continue
+            return self._skip_extraction(
+                event,
                 "raw",
-                "unsupported-helper",
+                "unsupported-segment",
                 raw_types,
                 parsed_types,
-                diagnostic_threshold,
             )
-            return True, None
 
-        data = self._value_of(target_segment, "data")
-        parsed_image = next(
-            (
-                item
-                for item in list(event.get_messages() or [])
-                if isinstance(item, Image)
-            ),
-            None,
+        parsed_images = [
+            item for item in list(event.get_messages() or [])
+            if isinstance(item, Image)
+        ]
+        self._match_parsed_images(media, parsed_images)
+        return self._candidate_from_parts(
+            event, "raw", parts, media, raw_types, parsed_types
         )
-        return True, _RepeatCandidate(
+
+    def _candidate_from_parts(
+        self,
+        event: AstrMessageEvent,
+        source: str,
+        parts,
+        media,
+        raw_types: str,
+        parsed_types: str,
+    ):
+        reason = self._parts_limit_reason(parts, media)
+        if reason is None:
+            reason = self._known_image_size_reason(media)
+        if reason is not None:
+            return self._skip_extraction(
+                event, source, reason, raw_types, parsed_types
+            )
+        if not parts:
+            return None
+        kind = "chain" if len(parts) > 1 else parts[0].kind
+        return _RepeatCandidate(
             kind=kind,
-            source="raw",
-            component=parsed_image,
-            data=data,
-            channel="mface" if kind == "mface" else "event",
-            chain=(
-                tuple(chain)
-                if kind == "image" and any(item[0] != "image" for item in chain)
-                else ()
-            ),
+            source=source,
+            raw_types=raw_types,
+            parsed_types=parsed_types,
+            parts=tuple(parts),
+            media=tuple(media),
         )
+
+    @staticmethod
+    def _parts_limit_reason(parts, media):
+        if len(parts) > _MAX_MEANINGFUL_PARTS:
+            return "meaningful-segment-limit"
+        if len(media) > _MAX_MEDIA_PARTS:
+            return "media-limit"
+        if sum(len(part.value) for part in parts if part.kind == "text") > _MAX_TEXT_CHARS:
+            return "text-limit"
+        if sum(part.kind == "at" for part in parts) > _MAX_AT_PARTS:
+            return "at-limit"
+        return None
+
+    @classmethod
+    def _known_image_size_reason(cls, media):
+        total = 0
+        for item in media:
+            if item.kind != "image":
+                continue
+            size = cls._known_image_size(item)
+            if size is None:
+                continue
+            if size > _MAX_IMAGE_BYTES:
+                return "image-size-limit"
+            total += size
+        return "total-image-size-limit" if total > _MAX_TOTAL_IMAGE_BYTES else None
+
+    @classmethod
+    def _known_image_size(cls, media):
+        values = [getattr(media.component, "base64_data", None)]
+        values.extend(
+            cls._value_of(media.data, key) for key in ("file", "url", "path")
+        )
+        for index, value in enumerate(values):
+            text = "" if value is None else str(value)
+            if not text:
+                continue
+            if index > 0 and not text.lower().startswith(
+                ("base64://", "data:")
+            ):
+                continue
+            try:
+                decoded, _ = cls._decode_base64_content(text)
+            except Exception:
+                continue
+            if decoded:
+                return len(decoded)
+        return None
+
+    @classmethod
+    def _match_parsed_images(cls, media, parsed_images):
+        unmatched = set(range(len(parsed_images)))
+        ambiguous = set()
+        for media_index, item in enumerate(media):
+            if item.kind != "image":
+                continue
+            raw_values = cls._raw_image_values(item)
+            raw_identity = {
+                value
+                for key, value in raw_values.items()
+                if key in ("file_unique", "file", "url", "path") and value
+            }
+            matches = []
+            for parsed_index in unmatched:
+                parsed_values = cls._parsed_image_component_values(
+                    parsed_images[parsed_index]
+                )
+                if raw_identity.intersection(value for value in parsed_values.values() if value):
+                    matches.append(parsed_index)
+            if len(matches) == 1:
+                chosen = matches[0]
+                item.component = parsed_images[chosen]
+                unmatched.remove(chosen)
+            elif len(matches) > 1:
+                ambiguous.add(media_index)
+
+        remaining_media = [
+            item
+            for index, item in enumerate(media)
+            if item.kind == "image" and item.component is None and index not in ambiguous
+        ]
+        for item, parsed_index in zip(remaining_media, sorted(unmatched)):
+            item.component = parsed_images[parsed_index]
+            unmatched.remove(parsed_index)
+
+    @classmethod
+    def _parsed_image_component_values(cls, component):
+        return {
+            key: cls._clean_value(getattr(component, key, None))
+            for key in ("file", "url", "path", "file_unique")
+        }
+
+    def _skip_extraction(
+        self,
+        event: AstrMessageEvent,
+        source: str,
+        reason: str,
+        raw_types: str,
+        parsed_types: str,
+    ):
+        self._debug_skip(
+            "chain",
+            source,
+            reason,
+            raw_types,
+            parsed_types,
+            self._diagnostic_threshold(event),
+        )
+        return None
 
     async def _resolve_candidate(
+        self, event: AstrMessageEvent, candidate: _RepeatCandidate, now: float
+    ):
+        total_image_bytes = 0
+        for media in candidate.media:
+            resolved = await self._resolve_media_candidate(event, media, now)
+            if resolved is None:
+                candidate.strategy = media.strategy
+                candidate.reason = media.reason
+                candidate.error_type = media.error_type
+                return None
+            if media.kind == "image" and media.content_base64:
+                decoded, _ = self._decode_base64_content(media.content_base64)
+                if len(decoded) > _MAX_IMAGE_BYTES:
+                    candidate.reason = "image-size-limit"
+                    candidate.strategy = "chain-size-check"
+                    return None
+                total_image_bytes += len(decoded)
+        if total_image_bytes > _MAX_TOTAL_IMAGE_BYTES:
+            candidate.reason = "total-image-size-limit"
+            candidate.strategy = "chain-size-check"
+            return None
+
+        if any(media.kind == "mface" for media in candidate.media):
+            bot = getattr(event, "bot", None)
+            if callable(getattr(bot, "send_group_msg", None)):
+                candidate.channel = "send_group_msg"
+            elif callable(getattr(bot, "call_action", None)):
+                candidate.channel = "call_action"
+            else:
+                mfaces = [
+                    media for media in candidate.media if media.kind == "mface"
+                ]
+                if not all(self._set_mface_gif_outbound(media) for media in mfaces):
+                    candidate.strategy = "missing-mface-channel"
+                    candidate.reason = "missing-channel"
+                    return None
+                candidate.channel = "event-gif"
+
+        identity_parts = self._normalized_chain_parts(candidate)
+        serialized = json.dumps(
+            [(part.kind, part.value) for part in identity_parts],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(serialized.encode()).hexdigest()
+        candidate.fingerprint = f"{_CHAIN_FINGERPRINT_VERSION}:{digest}"
+        candidate.strategy = _CHAIN_FINGERPRINT_VERSION
+        return candidate
+
+    async def _resolve_media_candidate(
         self, event: AstrMessageEvent, candidate: _RepeatCandidate, now: float
     ):
         if candidate.fingerprint:
@@ -366,7 +538,7 @@ class RepeatPlugin(Star):
         if market is not None:
             candidate.fingerprint, candidate.strategy = market
             if candidate.kind == "mface":
-                return self._resolve_mface_channel(event, candidate)
+                return candidate
             candidate.outbounds = self._image_outbound_candidates(candidate)
             candidate.outbound = (
                 candidate.outbounds[0] if candidate.outbounds else None
@@ -374,7 +546,7 @@ class RepeatPlugin(Star):
             if not candidate.outbounds:
                 candidate.reason = "missing-source"
                 return None
-            return self._apply_image_chain_fingerprint(candidate)
+            return candidate
         if candidate.kind == "mface":
             candidate.strategy = "missing-market-identity"
             candidate.reason = "missing-identity"
@@ -390,7 +562,7 @@ class RepeatPlugin(Star):
             if not candidate.outbounds:
                 candidate.reason = "missing-source"
                 return None
-            return self._apply_image_chain_fingerprint(candidate)
+            return candidate
 
         probe_entries = self._image_probe_candidates(candidate)
         if not probe_entries:
@@ -419,7 +591,7 @@ class RepeatPlugin(Star):
             candidate.probes = tuple(
                 item[1] for item in probe_entries[index:]
             )
-            return self._apply_image_chain_fingerprint(candidate)
+            return candidate
 
         fallback = self._fallback_image_identity(candidate)
         if fallback is not None:
@@ -429,7 +601,7 @@ class RepeatPlugin(Star):
                 candidate.outbounds[0] if candidate.outbounds else None
             )
             if candidate.outbounds:
-                return self._apply_image_chain_fingerprint(candidate)
+                return candidate
             candidate.reason = "missing-source"
             return None
 
@@ -601,26 +773,53 @@ class RepeatPlugin(Star):
                 candidates.append(outbound)
         return tuple(candidates)
 
-    @staticmethod
-    def _apply_image_chain_fingerprint(candidate: _RepeatCandidate):
-        if not candidate.chain:
-            return candidate
-        parts = [
-            (
-                kind,
-                candidate.fingerprint
-                if kind == "image"
-                else value.strip()
-                if kind == "text"
-                else value,
-            )
-            for kind, value in candidate.chain
-        ]
-        serialized = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
-        digest = hashlib.sha256(serialized.encode()).hexdigest()
-        candidate.fingerprint = f"image-chain:{digest}"
-        candidate.strategy = f"chain-{candidate.strategy}"
-        return candidate
+    @classmethod
+    def _normalized_output_parts(cls, candidate: _RepeatCandidate):
+        normalized = []
+        text_run = []
+
+        def flush_text():
+            if not text_run:
+                return
+            value = "".join(text_run).strip()
+            text_run.clear()
+            if value:
+                normalized.append(_ChainPart("text", value))
+
+        for part in candidate.parts:
+            if part.kind == "text":
+                text_run.append(part.value)
+                continue
+            flush_text()
+            normalized.append(part)
+        flush_text()
+        return tuple(normalized)
+
+    @classmethod
+    def _normalized_chain_parts(cls, candidate: _RepeatCandidate):
+        identity = []
+        for part in cls._normalized_output_parts(candidate):
+            if part.kind in ("image", "mface"):
+                media = candidate.media[part.media_index]
+                kind = (
+                    "market"
+                    if media.strategy.startswith("market-")
+                    else part.kind
+                )
+                identity.append(_ChainPart(kind, media.fingerprint or ""))
+            else:
+                identity.append(_ChainPart(part.kind, part.value))
+        return tuple(identity)
+
+    @classmethod
+    def _set_mface_gif_outbound(cls, media: _RepeatCandidate) -> bool:
+        gif_url = cls._candidate_data_value(
+            media, "url", "gif_url", "gifUrl"
+        )
+        if not cls._is_gif_url(gif_url):
+            return False
+        media.outbound = cls._image_from_source("url", gif_url)
+        return media.outbound is not None
 
     @classmethod
     def _candidate_data_value(cls, candidate: _RepeatCandidate, *keys):
@@ -778,76 +977,93 @@ class RepeatPlugin(Star):
         group_id: str,
         self_id: str,
     ) -> None:
-        if candidate.kind == "mface":
-            if candidate.channel == "event-gif":
-                await event.send(MessageChain([candidate.outbound]))
-                return
-            payload = self._mface_payload(candidate, group_id, self_id)
+        materialized = {}
+        total_image_bytes = 0
+        for index, media in enumerate(candidate.media):
+            if media.kind != "image":
+                continue
+            outbound, size = await self._materialize_image(media)
+            if size > _MAX_IMAGE_BYTES:
+                raise ValueError("image-size-limit")
+            total_image_bytes += size
+            if total_image_bytes > _MAX_TOTAL_IMAGE_BYTES:
+                raise ValueError("total-image-size-limit")
+            materialized[index] = outbound
+
+        if candidate.channel in ("send_group_msg", "call_action"):
+            payload = {
+                "group_id": group_id,
+                "message": self._onebot_message(candidate, materialized),
+            }
+            if self_id:
+                payload["self_id"] = self_id
             bot = getattr(event, "bot", None)
             if candidate.channel == "send_group_msg":
                 await bot.send_group_msg(**payload)
-                return
-            if candidate.channel == "call_action":
+            else:
                 await bot.call_action("send_group_msg", **payload)
-                return
-            raise RuntimeError("mface channel unavailable")
+            return
 
-        outbound = candidate.outbound
-        if candidate.kind == "image" and outbound is None:
-            probes = candidate.probes or (
-                (candidate.probe,) if candidate.probe is not None else ()
+        chain = self._event_message_chain(candidate, materialized)
+        await event.send(chain)
+
+    async def _materialize_image(self, media: _RepeatCandidate):
+        if media.content_base64:
+            content, canonical = self._decode_base64_content(
+                media.content_base64
             )
-            last_error = None
-            for probe in probes:
-                try:
-                    base64_data = await probe.convert_to_base64()
-                    content_bytes, base64_text = self._decode_base64_content(
-                        base64_data
-                    )
-                except Exception as e:
-                    last_error = e
-                    continue
-                if content_bytes:
-                    outbound = self._image_from_base64(base64_text)
-                    break
-            if outbound is None:
-                if last_error is not None:
-                    raise last_error
-                raise ValueError("empty image content")
-        if outbound is None and not candidate.outbounds:
-            raise ValueError("empty outbound component")
-        outbounds = candidate.outbounds or (outbound,)
+            return self._image_from_base64(canonical), len(content)
+
         last_error = None
-        for current in outbounds:
-            chain = self._image_message_chain(candidate, current)
+        for _, probe in self._image_probe_candidates(media):
             try:
-                await event.send(chain)
-                return
+                base64_data = await probe.convert_to_base64()
+                content, canonical = self._decode_base64_content(base64_data)
             except Exception as e:
                 last_error = e
+                continue
+            if content:
+                return self._image_from_base64(canonical), len(content)
         if last_error is not None:
             raise last_error
-        raise ValueError("empty outbound component")
+        raise ValueError("empty image content")
 
-    @staticmethod
-    def _image_message_chain(candidate: _RepeatCandidate, outbound):
-        if candidate.chain:
-            chain = []
-            for kind, value in candidate.chain:
-                if kind == "face":
-                    chain.append(Face(id=int(value)))
-                elif kind == "text":
-                    chain.append(Plain(value))
-                else:
-                    chain.append(outbound)
-        else:
-            chain = [outbound]
+    @classmethod
+    def _event_message_chain(cls, candidate, materialized):
+        chain = []
+        for part in cls._normalized_output_parts(candidate):
+            if part.kind == "text":
+                chain.append(Plain(part.value))
+            elif part.kind == "face":
+                chain.append(Face(id=int(part.value)))
+            elif part.kind == "at":
+                chain.append(At(qq=part.value))
+            elif part.kind == "image":
+                chain.append(materialized[part.media_index])
+            elif part.kind == "mface":
+                chain.append(candidate.media[part.media_index].outbound)
         return MessageChain(chain)
 
     @classmethod
-    def _mface_payload(
-        cls, candidate: _RepeatCandidate, group_id: str, self_id: str
-    ):
+    def _onebot_message(cls, candidate, materialized):
+        message = []
+        for part in cls._normalized_output_parts(candidate):
+            if part.kind == "text":
+                data = {"text": part.value}
+            elif part.kind == "face":
+                data = {"id": part.value}
+            elif part.kind == "at":
+                data = {"qq": part.value}
+            elif part.kind == "image":
+                image = materialized[part.media_index]
+                data = {"file": cls._clean_value(getattr(image, "file", None))}
+            else:
+                data = cls._mface_data(candidate.media[part.media_index])
+            message.append({"type": part.kind, "data": data})
+        return message
+
+    @classmethod
+    def _mface_data(cls, media):
         data = {}
         aliases = {
             "emoji_package_id": ("emoji_package_id", "emojiPackageId"),
@@ -856,12 +1072,20 @@ class RepeatPlugin(Star):
             "summary": ("summary",),
         }
         for output_key, keys in aliases.items():
-            value = cls._candidate_data_value(candidate, *keys)
+            value = cls._candidate_data_value(media, *keys)
             if value:
                 data[output_key] = value
+        return data
+
+    @classmethod
+    def _mface_payload(
+        cls, candidate: _RepeatCandidate, group_id: str, self_id: str
+    ):
         payload = {
             "group_id": group_id,
-            "message": [{"type": "mface", "data": data}],
+            "message": [
+                {"type": "mface", "data": cls._mface_data(candidate)}
+            ],
         }
         if self_id:
             payload["self_id"] = self_id
@@ -881,7 +1105,7 @@ class RepeatPlugin(Star):
         error_type: str | None = None,
         result: str = "observed",
     ) -> None:
-        if candidate.kind not in ("image", "mface"):
+        if not candidate.media and candidate.kind not in ("image", "mface"):
             return
         fingerprint = candidate.fingerprint or ""
         short_fingerprint = (

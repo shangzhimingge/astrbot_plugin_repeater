@@ -301,8 +301,9 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(first.sent, [])
         self.assertEqual(later.sent, [])
-        self.assertEqual(trigger.sent, [triggering_face])
-        self.assertIs(trigger.sent[0], triggering_face)
+        self.assertEqual(len(trigger.sent), 1)
+        self.assertIsInstance(trigger.sent[0], Face)
+        self.assertEqual(trigger.sent[0].id, triggering_face.id)
 
     async def test_plain_is_sent_unchanged(self):
         plugin = make_plugin()
@@ -314,8 +315,9 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
             plugin, "g", "u2", "A", 2, messages=[triggering]
         )
 
-        self.assertEqual(event.sent, [triggering])
-        self.assertIs(event.sent[0], triggering)
+        self.assertEqual(len(event.sent), 1)
+        self.assertIsInstance(event.sent[0], Plain)
+        self.assertEqual(event.sent[0].text, triggering.text)
 
     async def test_raw_file_unique_stabilizes_message_level_file_tokens(self):
         plugin = make_plugin()
@@ -350,8 +352,8 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(trigger.sent), 1)
         output = trigger.sent[0]
         self.assertIsNot(output, triggering)
-        self.assertEqual(output.constructed_by, "url")
-        self.assertEqual(output.converted_source, triggering.url)
+        self.assertEqual(output.constructed_by, "base64")
+        self.assertEqual(output.base64_data, encoded(triggering.url))
 
     async def test_long_tokens_with_same_trailing_hash_are_the_same_image(self):
         plugin = make_plugin()
@@ -408,8 +410,8 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     file="message-token",
                     path=f"/tmp/{digest}.png",
                 ),
-                "path",
-                f"/tmp/{digest}.png",
+                "base64",
+                "base64://" + encoded("message-token"),
             ),
             (
                 Image(
@@ -444,8 +446,13 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(event.sent), 1)
                 output = event.sent[0]
                 self.assertIsNot(output, triggering)
-                self.assertEqual(output.constructed_by, expected_constructor)
-                self.assertEqual(output.converted_source, expected_source)
+                self.assertEqual(output.constructed_by, "base64")
+                expected_base64 = (
+                    expected_source.removeprefix("base64://")
+                    if expected_constructor == "base64"
+                    else encoded(expected_source)
+                )
+                self.assertEqual(output.base64_data, expected_base64)
                 self.assertTrue(output.file)
 
     async def test_url_identity_uses_content_not_query_fields(self):
@@ -534,7 +541,7 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
             [("face", 1), ("image", f"base64://{encoded('x')}", None, None)],
         )
 
-    async def test_mixed_or_multi_component_message_is_ignored_without_cutting_segment(self):
+    async def test_supported_composite_cuts_segment_but_unknown_does_not(self):
         plugin = make_plugin()
         await deliver(plugin, "g", "u1", "", 1, messages=[Face(7)])
 
@@ -544,7 +551,8 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
         unsupported = await deliver(
             plugin, "g", "ignored2", "", 3, messages=[object()]
         )
-        trigger = await deliver(plugin, "g", "u2", "", 4, messages=[Face(7)])
+        await deliver(plugin, "g", "u2", "", 4, messages=[Face(7)])
+        trigger = await deliver(plugin, "g", "u3", "", 5, messages=[Face(7)])
 
         self.assertEqual(mixed.sent, [])
         self.assertEqual(unsupported.sent, [])
@@ -595,7 +603,8 @@ class RepeatBehaviorTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIsNot(retried.sent[0], retry_component)
                     self.assertTrue(retried.sent[0].converted_source)
                 else:
-                    self.assertIs(retried.sent[0], retry_component)
+                    self.assertIsInstance(retried.sent[0], Face)
+                    self.assertEqual(retried.sent[0].id, retry_component.id)
 
     async def test_component_senders_do_not_accumulate_during_cooldown(self):
         plugin = make_plugin(cooldown=10)
@@ -786,7 +795,7 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(trigger.sent[2], Image)
         self.assertEqual(trigger.sent[2].base64_data, content)
         self.assertIsInstance(trigger.sent[3], Plain)
-        self.assertEqual(trigger.sent[3].text, "  结尾")
+        self.assertEqual(trigger.sent[3].text, "结尾")
 
     async def test_caption_order_text_and_image_identity_cut_segments(self):
         content_a = encoded("image-a")
@@ -827,6 +836,379 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(changed.sent, [])
                 self.assertGreaterEqual(len(trigger.sent), 2)
 
+    async def test_adjacent_text_fingerprint_matches_visible_concatenation(self):
+        content = encoded("adjacent-text-image")
+
+        async def put(plugin, sender, now, text_parts):
+            token = f"temporary-{sender}-{now}"
+            raw = raw_event(
+                *(raw_segment("text", text=value) for value in text_parts),
+                raw_segment("image", file=token),
+            )
+            parsed = [Plain(value) for value in text_parts]
+            parsed.append(Image(file=token, base64_data=content))
+            return await deliver(
+                plugin,
+                "g",
+                sender,
+                "".join(text_parts),
+                now,
+                messages=parsed,
+                raw_message=raw,
+            )
+
+        same_visible = make_plugin()
+        await put(same_visible, "u1", 1, ("A ", "B"))
+        trigger = await put(same_visible, "u2", 2, ("A B",))
+        self.assertEqual(len(trigger.sent), 2)
+        self.assertEqual(trigger.sent[0].text, "A B")
+
+        different_spacing = make_plugin()
+        await put(different_spacing, "u1", 1, ("A ", "B"))
+        changed = await put(different_spacing, "u2", 2, ("A", "B"))
+        trigger_changed = await put(
+            different_spacing, "u3", 3, ("A", "B")
+        )
+        self.assertEqual(changed.sent, [])
+        self.assertEqual(len(trigger_changed.sent), 2)
+        self.assertEqual(trigger_changed.sent[0].text, "AB")
+
+    async def test_raw_plain_face_at_and_multiple_images_preserve_order(self):
+        plugin = make_plugin()
+        raw = raw_event(
+            raw_segment("text", text=" 开头 "),
+            raw_segment("face", id="12"),
+            raw_segment("at", qq="other-user"),
+            raw_segment("image", file="raw-a", file_unique="unique-a"),
+            raw_segment("text", text=" 中间 "),
+            raw_segment("image", file="raw-b", file_unique="unique-b"),
+            raw_segment("at", qq="all"),
+        )
+
+        def parsed():
+            return [
+                Plain(" 开头 "),
+                Face(12),
+                At("other-user"),
+                Image(
+                    file="parsed-b",
+                    file_unique="unique-b",
+                    base64_data=encoded("image-b"),
+                ),
+                Plain(" 中间 "),
+                Image(
+                    file="parsed-a",
+                    file_unique="unique-a",
+                    base64_data=encoded("image-a"),
+                ),
+                At("all"),
+            ]
+
+        await deliver(
+            plugin, "g", "u1", "开头中间", 1,
+            messages=parsed(), raw_message=raw,
+        )
+        trigger = await deliver(
+            plugin, "g", "u2", "开头中间", 2,
+            messages=parsed(), raw_message=raw,
+        )
+
+        self.assertEqual(len(trigger.send_attempts), 1)
+        self.assertEqual(
+            [type(item) for item in trigger.sent],
+            [Plain, Face, At, Image, Plain, Image, At],
+        )
+        self.assertEqual(trigger.sent[0].text, "开头")
+        self.assertEqual(trigger.sent[2].qq, "other-user")
+        self.assertEqual(trigger.sent[3].base64_data, encoded("image-a"))
+        self.assertEqual(trigger.sent[4].text, "中间")
+        self.assertEqual(trigger.sent[5].base64_data, encoded("image-b"))
+        self.assertEqual(trigger.sent[6].qq, "all")
+
+    async def test_parsed_only_composite_chain_matches_raw_semantics(self):
+        plugin = make_plugin()
+
+        def parsed(first_text=" 文本 "):
+            return [
+                Reply("ignored"),
+                Plain(" \n"),
+                At("bot"),
+                Plain(first_text),
+                Face(22),
+                At("other"),
+                Image(file="one", base64_data=encoded("one")),
+                Image(file="two", base64_data=encoded("two")),
+            ]
+
+        await deliver(plugin, "g", "u1", "文本", 1, messages=parsed())
+        trigger = await deliver(plugin, "g", "u2", "文本", 2, messages=parsed("文本"))
+
+        self.assertEqual(len(trigger.send_attempts), 1)
+        self.assertEqual(
+            [type(item) for item in trigger.sent],
+            [Plain, Face, At, Image, Image],
+        )
+        self.assertEqual(trigger.sent[0].text, "文本")
+        self.assertEqual(trigger.sent[2].qq, "other")
+
+    async def test_multi_image_rotating_sources_share_ordered_content_identity(self):
+        plugin = make_plugin()
+
+        async def put(sender, now, suffix, contents):
+            raw = raw_event(
+                raw_segment(
+                    "image",
+                    file=f"raw-a-{suffix}",
+                    url=f"https://cdn.test/a?fileid={suffix}&rkey=a-{suffix}",
+                ),
+                raw_segment("text", text="分隔"),
+                raw_segment(
+                    "image",
+                    file=f"raw-b-{suffix}",
+                    url=f"https://cdn.test/b?fileid={suffix}&rkey=b-{suffix}",
+                ),
+            )
+            parsed = [
+                Image(file=f"parsed-a-{suffix}", base64_data=contents[0]),
+                Plain("分隔"),
+                Image(file=f"parsed-b-{suffix}", base64_data=contents[1]),
+            ]
+            return await deliver(
+                plugin, "g", sender, "分隔", now,
+                messages=parsed, raw_message=raw,
+            )
+
+        await put("u1", 1, "one", (encoded("A"), encoded("B")))
+        trigger = await put("u2", 2, "two", (encoded("A"), encoded("B")))
+        self.assertEqual(len(trigger.sent), 3)
+
+        changed = await put("u3", 3, "three", (encoded("B"), encoded("A")))
+        self.assertEqual(changed.sent, [])
+
+    async def test_auxiliary_segments_are_removed_from_composite_identity(self):
+        plugin = make_plugin()
+        first_raw = raw_event(
+            raw_segment("reply", id="reply"),
+            raw_segment("text", text=" \n"),
+            raw_segment("at", qq="bot"),
+            raw_segment("text", text="正文"),
+            raw_segment("image", file="one"),
+        )
+        second_raw = raw_event(
+            raw_segment("text", text="正文"),
+            raw_segment("image", file="two"),
+        )
+        await deliver(
+            plugin, "g", "u1", "正文", 1,
+            messages=[Plain("正文"), Image(file="one", base64_data=encoded("same"))],
+            raw_message=first_raw,
+        )
+        trigger = await deliver(
+            plugin, "g", "u2", "正文", 2,
+            messages=[Plain("正文"), Image(file="two", base64_data=encoded("same"))],
+            raw_message=second_raw,
+        )
+        self.assertEqual(len(trigger.sent), 2)
+
+    async def test_at_value_and_part_count_changes_cut_composite_segment(self):
+        async def put(plugin, sender, now, at_values):
+            raw_parts = [raw_segment("text", text="正文")]
+            raw_parts.extend(raw_segment("at", qq=value) for value in at_values)
+            raw_parts.append(
+                raw_segment("image", file="raw", file_unique="stable-image")
+            )
+            return await deliver(
+                plugin, "g", sender, "正文", now,
+                messages=[Image(
+                    file="parsed",
+                    file_unique="stable-image",
+                    base64_data=encoded("image"),
+                )],
+                raw_message=raw_event(*raw_parts),
+            )
+
+        for first_values, changed_values in (
+            (("one",), ("two",)),
+            (("one",), ("one", "two")),
+        ):
+            with self.subTest(first=first_values, changed=changed_values):
+                plugin = make_plugin()
+                await put(plugin, "u1", 1, first_values)
+                changed = await put(plugin, "u2", 2, changed_values)
+                trigger = await put(plugin, "u3", 3, changed_values)
+                self.assertEqual(changed.sent, [])
+                self.assertEqual(
+                    [item.qq for item in trigger.sent if isinstance(item, At)],
+                    list(changed_values),
+                )
+
+    async def test_mface_mixed_chain_uses_onebot_order_and_retry_transaction(self):
+        bot = FakeDirectBot(failures=1)
+        plugin = make_plugin()
+        raw = raw_event(
+            raw_segment("text", text=" 开始 "),
+            raw_segment("mface", emoji_id="market-one", key="private-one"),
+            raw_segment("at", qq="other"),
+            raw_segment("face", id="33"),
+            raw_segment("image", file="raw-image", file_unique="image-unique"),
+            raw_segment("mface", emoji_id="market-two", key="private-two"),
+        )
+
+        def parsed():
+            return [Image(
+                file="parsed-image",
+                file_unique="image-unique",
+                base64_data=encoded("image"),
+            )]
+
+        await deliver(
+            plugin, "g", "u1", "开始", 1,
+            messages=parsed(), raw_message=raw, bot=bot,
+        )
+        failed = await deliver(
+            plugin, "g", "u2", "开始", 2,
+            messages=parsed(), raw_message=raw, bot=bot,
+        )
+        self.assertFalse(plugin._groups["g"].repeated_in_segment)
+        retried = await deliver(
+            plugin, "g", "u3", "开始", 3,
+            messages=parsed(), raw_message=raw, bot=bot,
+        )
+
+        self.assertEqual(failed.sent, [])
+        self.assertEqual(retried.sent, [])
+        self.assertEqual(len(bot.send_group_calls), 2)
+        payload = bot.send_group_calls[-1]
+        self.assertEqual(
+            [item["type"] for item in payload["message"]],
+            ["text", "mface", "at", "face", "image", "mface"],
+        )
+        self.assertEqual(payload["message"][0]["data"]["text"], "开始")
+        self.assertEqual(
+            payload["message"][1]["data"]["key"], "private-one"
+        )
+        self.assertTrue(plugin._groups["g"].repeated_in_segment)
+
+    async def test_mface_mixed_gif_fallback_requires_every_mface_url(self):
+        async def put(plugin, sender, now, include_second_url):
+            second_data = {"emoji_id": "two"}
+            if include_second_url:
+                second_data["url"] = "https://cdn.test/two.gif"
+            raw = raw_event(
+                raw_segment("mface", emoji_id="one", url="https://cdn.test/one.gif"),
+                raw_segment("text", text="组合"),
+                raw_segment("mface", **second_data),
+            )
+            return await deliver(
+                plugin, "g", sender, "组合", now,
+                messages=[Plain("组合")], raw_message=raw,
+                bot=SimpleNamespace(),
+            )
+
+        complete = make_plugin()
+        await put(complete, "u1", 1, True)
+        trigger = await put(complete, "u2", 2, True)
+        self.assertEqual(len(trigger.send_attempts), 1)
+        self.assertEqual(
+            [type(item) for item in trigger.sent], [Image, Plain, Image]
+        )
+
+        incomplete = make_plugin()
+        await put(incomplete, "u1", 1, False)
+        self.assertIn("g", incomplete._groups)
+        self.assertIsNone(incomplete._groups["g"].current_fingerprint)
+
+    async def test_composite_limits_and_unknown_skip_before_image_probe(self):
+        cases = []
+        cases.append((
+            raw_event(
+                *(raw_segment("reply", id=str(index)) for index in range(64)),
+                raw_segment("image", file="raw"),
+            ),
+            "raw-segment-limit",
+        ))
+        cases.append((
+            raw_event(
+                *(raw_segment("face", id=str(index)) for index in range(32)),
+                raw_segment("image", file="raw"),
+            ),
+            "meaningful-segment-limit",
+        ))
+        cases.append((
+            raw_event(
+                *(raw_segment("image", file=f"raw-{index}") for index in range(9))
+            ),
+            "media-limit",
+        ))
+        cases.append((
+            raw_event(
+                raw_segment("text", text="x" * 4097),
+                raw_segment("image", file="raw"),
+            ),
+            "text-limit",
+        ))
+        cases.append((
+            raw_event(
+                *(raw_segment("at", qq=str(index)) for index in range(9)),
+                raw_segment("image", file="raw"),
+            ),
+            "at-limit",
+        ))
+        cases.append((
+            raw_event(
+                raw_segment("record", file="secret-record"),
+                raw_segment("image", file="raw"),
+            ),
+            "unsupported-segment",
+        ))
+
+        for index, (raw, reason) in enumerate(cases):
+            with self.subTest(reason=reason):
+                LOGGER.infos.clear()
+                image = Image(file=f"probe-secret-{index}")
+                plugin = make_plugin(media_diagnostics=True)
+                await deliver(
+                    plugin, "g", "u", "secret-text", index,
+                    messages=[image], raw_message=raw,
+                )
+                self.assertEqual(image.convert_calls, 0)
+                self.assertEqual(plugin._groups, {})
+                info = rendered_infos()
+                self.assertIn(f"reason={reason}", info)
+                self.assertNotIn("secret-record", info)
+                self.assertNotIn("secret-text", info)
+                self.assertNotIn(f"probe-secret-{index}", info)
+
+    async def test_decoded_image_limits_skip_whole_chain(self):
+        oversized = encoded(b"x" * (10 * 1024 * 1024 + 1))
+        image = Image(file="oversized", base64_data=oversized)
+        plugin = make_plugin(media_diagnostics=True)
+        await deliver(
+            plugin, "g", "u", "", 1,
+            messages=[image], raw_message=raw_event(raw_segment("image", file="raw")),
+        )
+        self.assertEqual(image.convert_calls, 0)
+        self.assertEqual(plugin._groups, {})
+        self.assertIn("reason=image-size-limit", rendered_infos())
+
+        LOGGER.infos.clear()
+        shared = encoded(b"y" * (7 * 1024 * 1024))
+        images = [
+            Image(file=f"total-{index}", base64_data=shared)
+            for index in range(3)
+        ]
+        total = make_plugin(media_diagnostics=True)
+        await deliver(
+            total, "g", "u", "", 2,
+            messages=images,
+            raw_message=raw_event(
+                *(raw_segment("image", file=f"raw-{index}") for index in range(3))
+            ),
+        )
+        self.assertEqual([image.convert_calls for image in images], [0, 0, 0])
+        self.assertEqual(total._groups, {})
+        self.assertIn("reason=total-image-size-limit", rendered_infos())
+
     async def test_captioned_image_send_failure_retries_same_content(self):
         plugin = make_plugin()
         content = encoded("retry-captioned-image")
@@ -856,50 +1238,6 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(retried.sent[0].text, "说明")
         self.assertEqual(retried.sent[1].base64_data, content)
         self.assertTrue(plugin._groups["g"].repeated_in_segment)
-
-    async def test_captioned_image_keeps_existing_rejection_boundaries(self):
-        invalid = (
-            (
-                raw_event(
-                    raw_segment("text", text="说明"),
-                    raw_segment("at", qq="someone-else"),
-                    raw_segment("image", file="one"),
-                ),
-                [Plain("说明"), Image(file="one")],
-            ),
-            (
-                raw_event(
-                    raw_segment("text", text="说明"),
-                    raw_segment("other", value="unknown"),
-                    raw_segment("image", file="one"),
-                ),
-                [Plain("说明"), Image(file="one")],
-            ),
-            (
-                raw_event(
-                    raw_segment("text", text="说明"),
-                    raw_segment("image", file="one"),
-                    raw_segment("image", file="two"),
-                ),
-                [Plain("说明"), Image(file="one"), Image(file="two")],
-            ),
-            (
-                raw_event(
-                    raw_segment("text", text="说明"),
-                    raw_segment("mface", emoji_id="market-one"),
-                ),
-                [Plain("说明")],
-            ),
-        )
-        for index, (raw, parsed) in enumerate(invalid):
-            with self.subTest(index=index):
-                plugin = make_plugin()
-                event = await deliver(
-                    plugin, "g", "u", "说明", index,
-                    messages=parsed, raw_message=raw,
-                )
-                self.assertEqual(event.sent, [])
-                self.assertEqual(plugin._groups, {})
 
     async def test_face_image_send_failure_retries_complete_chain(self):
         plugin = make_plugin()
@@ -957,7 +1295,7 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 trigger = await put("u2", 2, "raw-message-token-two")
 
                 self.assertEqual(len(trigger.sent), 2)
-                self.assertEqual(trigger.sent[1].constructed_by, constructor)
+                self.assertEqual(trigger.sent[1].constructed_by, "base64")
 
     async def test_image_probe_falls_back_until_a_source_converts(self):
         plugin = make_plugin()
@@ -1039,14 +1377,10 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await put("u1", 1)
         trigger = await put("u2", 2)
 
-        self.assertEqual(len(trigger.send_attempts), 2)
-        self.assertEqual(
-            [attempt[1].converted_source for attempt in trigger.send_attempts],
-            [bad_url, good_url],
-        )
+        self.assertEqual(len(trigger.send_attempts), 1)
         self.assertEqual(sent_values(trigger), [
             ("face", 339),
-            ("image", good_url, good_url, None),
+            ("image", f"base64://{encoded(good_url)}", None, None),
         ])
         self.assertTrue(plugin._groups["g"].repeated_in_segment)
         self.assertEqual(plugin._groups["g"].last_repeat_time, 2)
@@ -1239,7 +1573,7 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 )
 
                 self.assertEqual(len(trigger.sent), 1)
-                self.assertEqual(trigger.sent[0].constructed_by, "url")
+                self.assertEqual(trigger.sent[0].constructed_by, "base64")
 
     async def test_raw_image_allows_only_blank_text_reply_and_self_at_helpers(self):
         raw = raw_event(
@@ -1265,19 +1599,11 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(trigger.sent), 1)
 
-    async def test_raw_media_rejects_unknown_other_at_and_multiple_media(self):
+    async def test_raw_media_rejects_unknown_segments(self):
         invalid_raw_messages = (
             raw_event(
                 raw_segment("image", file="a", url="https://e.test/a.png"),
                 raw_segment("other", value="unknown-secret"),
-            ),
-            raw_event(
-                raw_segment("image", file="a", url="https://e.test/a.png"),
-                raw_segment("at", qq="someone-else"),
-            ),
-            raw_event(
-                raw_segment("image", file="a", url="https://e.test/a.png"),
-                raw_segment("mface", emoji_package_id="1", emoji_id="2"),
             ),
         )
         for raw in invalid_raw_messages:
@@ -1566,10 +1892,8 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         trigger = await put("u2", 2, "rotating-two")
 
         self.assertEqual(len(trigger.sent), 1)
-        expected = hashlib.sha256(b"stable-picture.png").hexdigest()
-        self.assertEqual(
-            plugin._groups["g"].current_fingerprint,
-            f"image:content:{expected}",
+        self.assertTrue(
+            plugin._groups["g"].current_fingerprint.startswith("chain-v1:")
         )
 
     async def test_short_parsed_file_and_path_probe_before_raw_urls(self):
@@ -1606,10 +1930,10 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 await put("u1", 1)
                 trigger = await put("u2", 2)
                 self.assertEqual(len(trigger.sent), 1)
-                expected = hashlib.sha256(content).hexdigest()
-                self.assertEqual(
-                    plugin._groups["g"].current_fingerprint,
-                    f"image:content:{expected}",
+                self.assertTrue(
+                    plugin._groups["g"].current_fingerprint.startswith(
+                        "chain-v1:"
+                    )
                 )
 
     async def test_parsed_file_url_hashes_content_before_url_tokens(self):
@@ -1712,7 +2036,9 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
             messages=[Image(file=token_two, base64_data=same_content)],
         )
         self.assertEqual(len(trigger.sent), 1)
-        self.assertIn("image:content:", same._groups["g"].current_fingerprint)
+        self.assertTrue(
+            same._groups["g"].current_fingerprint.startswith("chain-v1:")
+        )
 
         different = make_plugin()
         await deliver(
@@ -1747,10 +2073,12 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
             messages=[stable_image],
         )
         self.assertEqual(stable_image.convert_calls, 1)
-        self.assertIn(
-            "parsed-file", stable._groups["stable-group"].current_fingerprint
+        self.assertTrue(
+            stable._groups["stable-group"].current_fingerprint.startswith(
+                "chain-v1:"
+            )
         )
-        self.assertIn("strategy=fallback-parsed-file", rendered_infos())
+        self.assertIn("strategy=chain-v1", rendered_infos())
 
         weak = make_plugin(threshold=3, media_diagnostics=True)
         weak_token = "temporary-opaque-token-" + "X" * 400
@@ -1796,10 +2124,8 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         output = events[-1].sent[0]
         self.assertEqual(output.base64_data, canonical)
         self.assertEqual(output.file, f"base64://{canonical}")
-        expected = hashlib.sha256(raw_bytes).hexdigest()
-        self.assertEqual(
-            plugin._groups["g"].current_fingerprint,
-            f"image:content:{expected}",
+        self.assertTrue(
+            plugin._groups["g"].current_fingerprint.startswith("chain-v1:")
         )
 
         different = make_plugin()
@@ -1829,8 +2155,10 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_skip_diagnostics_cover_raw_and_parsed_reasons_redacted(self):
         invalid = (
             raw_event(
-                raw_segment("image", file="secret-token-one"),
-                raw_segment("mface", key="secret-key-one"),
+                *(
+                    raw_segment("image", file=f"secret-token-{index}")
+                    for index in range(9)
+                ),
             ),
             raw_event(
                 raw_segment(
@@ -1841,7 +2169,10 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
             ),
             raw_event(
                 raw_segment("image", file="secret-token-two"),
-                raw_segment("at", qq="secret-other-user"),
+                *(
+                    raw_segment("at", qq=f"secret-other-user-{index}")
+                    for index in range(9)
+                ),
             ),
             raw_event(raw_segment("mface", summary="secret-summary")),
             raw_event(raw_segment("image")),
@@ -1862,9 +2193,9 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         diagnostics = rendered_debugs()
         for reason in (
-            "multiple-media",
-            "unsupported-helper",
-            "other-at",
+            "media-limit",
+            "unsupported-segment",
+            "at-limit",
             "missing-identity",
             "missing-source",
         ):
