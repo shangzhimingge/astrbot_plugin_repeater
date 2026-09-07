@@ -67,6 +67,7 @@ _MAX_TEXT_CHARS = 4096
 _MAX_AT_PARTS = 8
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
+_MAX_BASE64_OVERHEAD = 256
 
 
 @dataclass(slots=True)
@@ -401,20 +402,35 @@ class RepeatPlugin(Star):
 
     @classmethod
     def _known_image_size(cls, media):
-        values = [getattr(media.component, "base64_data", None)]
+        component = media.component
+        values = [(getattr(component, "base64_data", None), True)]
         values.extend(
-            cls._value_of(media.data, key) for key in ("file", "url", "path")
+            (value, False)
+            for value in (
+                *(getattr(component, key, None) for key in ("file", "url", "path")),
+                *(cls._value_of(media.data, key) for key in ("file", "url", "path")),
+            )
         )
-        for index, value in enumerate(values):
-            text = "" if value is None else str(value)
+        for value, allow_bare in values:
+            if value is None:
+                continue
+            text = value if isinstance(value, (str, bytes)) else str(value)
             if not text:
                 continue
-            if index > 0 and not text.lower().startswith(
-                ("base64://", "data:")
+            prefix = text[:64].lstrip().lower()
+            base64_prefixes = (
+                (b"base64://", b"data:")
+                if isinstance(prefix, bytes)
+                else ("base64://", "data:")
+            )
+            if not allow_bare and not prefix.startswith(
+                base64_prefixes
             ):
                 continue
             try:
-                size = cls._estimated_base64_size(text)
+                size = cls._estimated_base64_size(
+                    text, max_bytes=_MAX_IMAGE_BYTES
+                )
             except Exception:
                 continue
             if size:
@@ -424,30 +440,38 @@ class RepeatPlugin(Star):
     @classmethod
     def _match_parsed_images(cls, media, parsed_images):
         unmatched = set(range(len(parsed_images)))
-        for item in media:
-            if item.kind != "image":
-                continue
-            raw_values = cls._raw_image_values(item)
-            raw_identity = {
-                value
-                for key, value in raw_values.items()
-                if key in ("file_unique", "file", "url", "path") and value
-            }
-            matches = []
+        raw_images = [item for item in media if item.kind == "image"]
+        parsed_values = [
+            cls._parsed_image_component_values(component)
+            for component in parsed_images
+        ]
+
+        for field in ("file_unique", "url", "path", "file"):
+            raw_by_value = {}
+            for raw_index, item in enumerate(raw_images):
+                if item.component is not None:
+                    continue
+                value = cls._raw_image_values(item)[field]
+                if value:
+                    raw_by_value.setdefault(value, []).append(raw_index)
+
+            parsed_by_value = {}
             for parsed_index in unmatched:
-                parsed_values = cls._parsed_image_component_values(
-                    parsed_images[parsed_index]
-                )
-                if raw_identity.intersection(value for value in parsed_values.values() if value):
-                    matches.append(parsed_index)
-            if len(matches) == 1:
-                chosen = matches[0]
-                item.component = parsed_images[chosen]
-                unmatched.remove(chosen)
+                value = parsed_values[parsed_index][field]
+                if value:
+                    parsed_by_value.setdefault(value, []).append(parsed_index)
+
+            unique_pairs = []
+            for value, raw_indices in raw_by_value.items():
+                parsed_indices = parsed_by_value.get(value, ())
+                if len(raw_indices) == 1 and len(parsed_indices) == 1:
+                    unique_pairs.append((raw_indices[0], parsed_indices[0]))
+            for raw_index, parsed_index in sorted(unique_pairs):
+                raw_images[raw_index].component = parsed_images[parsed_index]
+                unmatched.remove(parsed_index)
+
         remaining_media = [
-            item
-            for item in media
-            if item.kind == "image" and item.component is None
+            item for item in raw_images if item.component is None
         ]
         if len(remaining_media) == len(unmatched):
             for item, parsed_index in zip(remaining_media, sorted(unmatched)):
@@ -582,7 +606,13 @@ class RepeatPlugin(Star):
         for index, (label, probe) in enumerate(probe_entries):
             try:
                 base64_data = await probe.convert_to_base64()
-                estimated_size = self._estimated_base64_size(base64_data)
+                estimated_size = self._estimated_base64_size(
+                    base64_data,
+                    max_bytes=min(
+                        _MAX_IMAGE_BYTES,
+                        remaining_image_bytes or _MAX_IMAGE_BYTES,
+                    ),
+                )
                 if estimated_size > _MAX_IMAGE_BYTES:
                     candidate.strategy = "content-size-check"
                     candidate.reason = "image-size-limit"
@@ -931,8 +961,20 @@ class RepeatPlugin(Star):
         return re.sub(r"\s+", "", text)
 
     @classmethod
-    def _estimated_base64_size(cls, value) -> int:
-        text = cls._base64_payload(value)
+    def _estimated_base64_size(
+        cls, value, max_bytes: int | None = None
+    ) -> int:
+        if isinstance(value, bytes):
+            raw = value
+        elif isinstance(value, str):
+            raw = value
+        else:
+            raw = str(value or "")
+        if max_bytes is not None:
+            encoded_limit = 4 * ((max_bytes + 2) // 3)
+            if len(raw) > encoded_limit + _MAX_BASE64_OVERHEAD:
+                return max_bytes + 1
+        text = cls._base64_payload(raw)
         if not text:
             return 0
         if len(text) % 4 == 1:
@@ -1053,7 +1095,10 @@ class RepeatPlugin(Star):
         if media.content_base64:
             size = media.content_size
             if size is None:
-                size = self._estimated_base64_size(media.content_base64)
+                size = self._estimated_base64_size(
+                    media.content_base64,
+                    max_bytes=min(_MAX_IMAGE_BYTES, remaining_image_bytes),
+                )
             self._check_image_size(size, remaining_image_bytes)
             return self._image_from_base64(media.content_base64), size
 
@@ -1061,7 +1106,10 @@ class RepeatPlugin(Star):
         for _, probe in self._image_probe_candidates(media):
             try:
                 base64_data = await probe.convert_to_base64()
-                size = self._estimated_base64_size(base64_data)
+                size = self._estimated_base64_size(
+                    base64_data,
+                    max_bytes=min(_MAX_IMAGE_BYTES, remaining_image_bytes),
+                )
                 self._check_image_size(size, remaining_image_bytes)
                 content, canonical = self._decode_base64_content(base64_data)
             except _MediaLimitError:

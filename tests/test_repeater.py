@@ -1016,6 +1016,57 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
             [encoded("A"), encoded("B")],
         )
 
+    async def test_strong_unique_match_precedes_weak_file_collision(self):
+        plugin = make_plugin()
+        raw = raw_event(
+            raw_segment(
+                "image",
+                file="shared-file",
+                url="https://raw.test/a",
+            ),
+            raw_segment(
+                "image",
+                file="raw-b",
+                url="https://raw.test/b",
+                file_unique="unique-b",
+            ),
+        )
+        Image.conversion_payloads.update({
+            "https://raw.test/a": encoded("A"),
+            "https://raw.test/b": encoded("B"),
+        })
+
+        def parsed_b():
+            return Image(
+                file="shared-file",
+                file_unique="unique-b",
+                base64_data=encoded("B"),
+            )
+
+        await deliver(
+            plugin,
+            "g",
+            "u1",
+            "",
+            1,
+            messages=[parsed_b()],
+            raw_message=raw,
+        )
+        trigger = await deliver(
+            plugin,
+            "g",
+            "u2",
+            "",
+            2,
+            messages=[parsed_b()],
+            raw_message=raw,
+        )
+
+        self.assertEqual(
+            [item.base64_data for item in trigger.sent],
+            [encoded("A"), encoded("B")],
+        )
+
     async def test_ambiguous_duplicate_image_matches_fall_back_by_order(self):
         plugin = make_plugin()
         raw = raw_event(
@@ -1327,6 +1378,39 @@ class RawMediaBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plugin._groups, {})
         self.assertEqual(image.convert_calls, 0)
         self.assertIn("reason=image-size-limit", rendered_infos())
+
+    async def test_parsed_base64_sources_are_bounded_before_normalization(self):
+        oversized = "base64://" + "A" * 1000
+        factories = (
+            lambda: Image(file=oversized),
+            lambda: Image(file="placeholder", url=oversized),
+            lambda: Image(file=None, path=oversized),
+            lambda: Image(file="data:image/png;base64," + "A" * 1000),
+        )
+
+        for factory in factories:
+            with self.subTest(image=vars(factory())):
+                LOGGER.infos.clear()
+                plugin = make_plugin(media_diagnostics=True)
+                image = factory()
+                with (
+                    mock.patch.object(main, "_MAX_IMAGE_BYTES", 10),
+                    mock.patch.object(main, "_MAX_TOTAL_IMAGE_BYTES", 20),
+                    mock.patch.object(
+                        main.re,
+                        "sub",
+                        side_effect=AssertionError(
+                            "Base64 normalized before bounded length check"
+                        ),
+                    ),
+                ):
+                    await deliver(
+                        plugin, "g", "u", "", 1, messages=[image]
+                    )
+
+                self.assertEqual(plugin._groups, {})
+                self.assertEqual(image.convert_calls, 0)
+                self.assertIn("reason=image-size-limit", rendered_infos())
 
     async def test_captioned_image_send_failure_retries_same_content(self):
         plugin = make_plugin()
