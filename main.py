@@ -285,10 +285,14 @@ class RepeatPlugin(Star):
                 continue
             if segment_type == "reply":
                 continue
-            if segment_type == "text" and not self._clean_value(
-                self._value_of(data, "text")
-            ):
-                continue
+            if segment_type == "text":
+                raw_text = self._value_of(data, "text")
+                text_value = "" if raw_text is None else str(raw_text)
+                if not text_value.strip():
+                    continue
+                if kind == "image":
+                    chain.append(("text", text_value))
+                    continue
             if segment_type == "text":
                 self._debug_skip(
                     kind,
@@ -345,7 +349,7 @@ class RepeatPlugin(Star):
             channel="mface" if kind == "mface" else "event",
             chain=(
                 tuple(chain)
-                if kind == "image" and any(item[0] == "face" for item in chain)
+                if kind == "image" and any(item[0] != "image" for item in chain)
                 else ()
             ),
         )
@@ -599,10 +603,17 @@ class RepeatPlugin(Star):
 
     @staticmethod
     def _apply_image_chain_fingerprint(candidate: _RepeatCandidate):
-        if not any(kind == "face" for kind, _ in candidate.chain):
+        if not candidate.chain:
             return candidate
         parts = [
-            (kind, value if kind == "face" else candidate.fingerprint)
+            (
+                kind,
+                candidate.fingerprint
+                if kind == "image"
+                else value.strip()
+                if kind == "text"
+                else value,
+            )
             for kind, value in candidate.chain
         ]
         serialized = json.dumps(parts, ensure_ascii=False, separators=(",", ":"))
@@ -823,7 +834,12 @@ class RepeatPlugin(Star):
         if candidate.chain:
             chain = []
             for kind, value in candidate.chain:
-                chain.append(Face(id=int(value)) if kind == "face" else outbound)
+                if kind == "face":
+                    chain.append(Face(id=int(value)))
+                elif kind == "text":
+                    chain.append(Plain(value))
+                else:
+                    chain.append(outbound)
         else:
             chain = [outbound]
         return MessageChain(chain)
