@@ -73,7 +73,7 @@ A：不会。按「不同的人」计数，同一个人重复发只算 1 人。
 A：删除 `main.py` 中 `on_group_message` 上方的 `@filter.platform_adapter_type(...)` 一行即可（保留群聊过滤即可）。
 
 **Q：数据存在哪里？**
-A：群设置保存在 AstrBot 的 `data/astrbot_plugin_repeater/state.json`，不在插件目录内，更新/重装插件不会丢失。
+A：群设置保存在 AstrBot 官方插件数据目录 `data/plugin_data/astrbot_plugin_repeater/state.json`（通过 `StarTools.get_data_dir()` 获取），不在插件自身目录内，更新/重装插件不会丢失，也便于统一备份与迁移。
 
 ## 开发与测试
 

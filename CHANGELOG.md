@@ -3,6 +3,12 @@
 本文件记录 `astrbot_plugin_repeater` 的所有重要变更。
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1] - 2026-10-03
+
+### 修复
+
+- **修复插件数据持久化路径不符合规范的问题**：群状态 `state.json` 改为写入 AstrBot 官方插件数据目录 `data/plugin_data/astrbot_plugin_repeater/`（通过 `StarTools.get_data_dir()` 获取），不再写入 `data/astrbot_plugin_repeater/`，以保证用户数据迁移与审计的一致性。
+
 ## [1.1.0] - 2026-10-03
 
 ### 修复
@@ -22,4 +28,5 @@
 
 - 首个版本：当群内连续 N 个不同的人发送相同消息时，机器人自动跟一条相同消息；支持按群独立开关、自定义触发人数（默认 3）与触发冷却时间；适配 NapCatQQ（OneBot v11 / aiocqhttp）。
 
+[1.1.1]: https://github.com/yoser-s/astrbot_plugin_repeater/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/yoser-s/astrbot_plugin_repeater/compare/v1.0.0...v1.1.0

@@ -7,10 +7,10 @@
 #  - 复读会保留 QQ 小黄脸（Face）表情。
 #
 # 说明：核心逻辑在 process_message() 中，为纯同步函数，便于本地单元测试；
-#      事件监听 / 指令处理只是薄封装。持久化数据存放于 AstrBot 的 data 目录。
+#      事件监听 / 指令处理只是薄封装。持久化数据存放于 AstrBot 的
+#      data/plugin_data/<插件名>/ 目录。
 
 import json
-import os
 import re
 import threading
 import time
@@ -19,7 +19,7 @@ from pathlib import Path
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Face, Plain
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 
 # 指令组：群内通过 `/复读机 子指令` 控制复读机
@@ -277,22 +277,13 @@ class RepeatPlugin(Star):
         return max(0.0, v)
 
     def _data_dir(self) -> Path:
-        """返回 AstrBot 的 data 目录下的专属数据目录。
+        """返回 AstrBot 官方规定的插件数据目录。
 
-        插件位于 data/plugins/<插件名>/main.py，因此 data 目录是
-        __file__ 向上三级。持久化数据不放进插件自身目录，防止插件
+        即 ``data/plugin_data/<插件名>/``，通过 AstrBot 的 ``StarTools``
+        统一获取，便于数据备份、迁移与审计；不写入插件自身目录，避免插件
         更新/重装时数据被覆盖。
         """
-        p = Path(os.path.abspath(__file__))
-        candidates = [p.parents[2], Path(os.getcwd()) / "data"]
-        for base in candidates:
-            try:
-                target = base / "astrbot_plugin_repeater"
-                target.mkdir(parents=True, exist_ok=True)
-                return target
-            except Exception:
-                continue
-        return p.parent  # 最终兜底：插件自身目录
+        return StarTools.get_data_dir("astrbot_plugin_repeater")
 
     def _load_state(self):
         try:
