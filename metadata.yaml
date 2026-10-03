@@ -6,7 +6,7 @@ desc: 群复读机：当群内连续 N 个不同的人发送相同消息时，�
 # 作者
 author: yosers
 # 版本号
-version: 1.0.0
+version: 1.1.0
 # 仓库地址
 repo: https://github.com/yoser-s/astrbot_plugin_repeater
 # 插件展示名（可选）

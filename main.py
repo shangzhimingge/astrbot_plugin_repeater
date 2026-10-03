@@ -4,6 +4,7 @@
 #  - N 可通过 WebUI 配置或群内指令自定义（默认 3）。
 #  - 每个群可独立开关复读机模式（/复读机 开|关）。
 #  - 支持触发冷却时间，防止机器人刷屏。
+#  - 复读会保留 QQ 小黄脸（Face）表情。
 #
 # 说明：核心逻辑在 process_message() 中，为纯同步函数，便于本地单元测试；
 #      事件监听 / 指令处理只是薄封装。持久化数据存放于 AstrBot 的 data 目录。
@@ -17,7 +18,7 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
-from astrbot.api.message_components import Plain
+from astrbot.api.message_components import Face, Plain
 from astrbot.api.star import Context, Star
 
 
@@ -42,6 +43,7 @@ class _GroupState:
         "cooldown",
         "current_text",
         "senders",
+        "repeated",
         "last_repeat_time",
     )
 
@@ -51,6 +53,7 @@ class _GroupState:
         self.cooldown = cooldown
         self.current_text: str | None = None  # 当前正在统计的消息指纹
         self.senders: set[str] = set()  # 已发送该消息的不同人（去重）
+        self.repeated: bool = False  # 本轮接龙是否已经复读过
         self.last_repeat_time: float = 0.0  # 上次触发复读的时间戳
 
 
@@ -70,36 +73,40 @@ class RepeatPlugin(Star):
     # 核心逻辑（纯同步函数，便于本地测试）
     # ------------------------------------------------------------------
     def process_message(
-        self, group_id: str, sender_id: str, text: str, now: float
-    ) -> str | None:
-        """处理一条群消息，返回需要复读的文本；未达到条件时返回 None。
+        self, group_id: str, sender_id: str, content: str, now: float
+    ) -> bool:
+        """处理一条群消息，返回是否需要复读。
 
-        - 只统计【连续】发送的相同消息，内容一变就重新计数；
+        - content 为消息内容指纹（文本 + 表情），只统计【连续】发送的相同内容；
         - 同一个人的多次重复只算 1 人；
-        - 达到阈值并复读后重置计数，避免同一波刷屏被反复复读；
+        - 一轮接龙在未被打断（内容保持不变）前只复读一次；内容被打断
+          （变成别的消息）后重新开始计数，之后可再次复读；
         - 支持冷却时间（seconds）。
         """
         state = self._get_group(group_id)
-        text = (text or "").strip()
+        content = (content or "").strip()
         with self._lock:
-            if not state.enabled or not text:
-                return None
-            if text != state.current_text:
-                # 消息内容变了：重新开始计数
-                state.current_text = text
+            if not state.enabled or not content:
+                return False
+            if content != state.current_text:
+                # 接龙内容变化：开始新的一轮，重置计数与「已复读」标记
+                state.current_text = content
                 state.senders = {sender_id}
-                return None
+                state.repeated = False
+                return False
+            if state.repeated:
+                # 本轮接龙已经复读过，不再重复，直到被打断（内容变化）
+                return False
             state.senders.add(sender_id)
             if len(state.senders) < state.threshold:
-                return None
+                return False
             # 达到阈值：检查冷却时间
             if state.cooldown > 0 and now - state.last_repeat_time < state.cooldown:
-                return None
-            # 触发复读并重置计数
-            state.current_text = None
-            state.senders = set()
+                return False
+            # 触发复读，并标记本轮已复读（不重置内容指纹，保证接龙判定连续）
+            state.repeated = True
             state.last_repeat_time = now
-            return text
+            return True
 
     # ------------------------------------------------------------------
     # 事件监听：群消息
@@ -125,9 +132,12 @@ class RepeatPlugin(Star):
         # 忽略复读机指令本身
         if text.strip() and _CMD_PATTERN.match(text.strip()):
             return
-        reply_text = self.process_message(group_id, sender_id, text, time.time())
-        if reply_text is not None:
-            await event.send(MessageChain([Plain(reply_text)]))
+        # 以「文本 + QQ 表情」构造内容指纹与复读用消息链，避免复读丢失小黄脸
+        content, reply_chain = self._build_content(text, event.get_messages())
+        if not content:
+            return
+        if self.process_message(group_id, sender_id, content, time.time()):
+            await event.send(MessageChain(reply_chain))
 
     # ------------------------------------------------------------------
     # 指令组：群内控制
@@ -213,6 +223,25 @@ class RepeatPlugin(Star):
     # ------------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------------
+    @staticmethod
+    def _build_content(text: str, components) -> tuple[str, list]:
+        """构造内容指纹（用于接龙判定）与复读用消息链。
+
+        文本沿用 message_str（与旧逻辑一致，含 @ 文本），并额外保留下 QQ
+        小黄脸（Face）表情：旧实现只用 message_str，表情既不参与判重，
+        复读时也会丢失。此处在指纹与复读消息链中都带上表情 id。
+        """
+        comps = list(components or [])
+        faces = [c for c in comps if isinstance(c, Face)]
+        key = (text or "").strip()
+        if faces:
+            key += "".join(f"[Face:{f.id}]" for f in faces)
+        chain: list = []
+        if (text or "").strip():
+            chain.append(Plain(text))
+        chain.extend(Face(id=f.id) for f in faces)
+        return key, chain
+
     def _event_group_id(self, event: AstrMessageEvent) -> str:
         return str(getattr(event.message_obj, "group_id", "") or "")
 
