@@ -12,7 +12,7 @@ AstrBot 群复读机插件：当群里连续 **N 个不同的人** 发送了相�
 - ✅ 自定义触发人数（默认 3，范围 2~50）
 - ✅ 按「不同的人」计数：同一个人刷 10 条也只算 1 人
 - ✅ 只统计**连续**发送的相同消息，内容一变自动重新计数
-- ✅ 支持文本、QQ 表情、@、多张图片和商城动画表情按原顺序组成的复合消息
+- ✅ 支持文本、QQ 内置小黄脸表情（Face）、@、多张图片和商城动画表情按原顺序组成的复合消息
 - ✅ 同一连续有效消息段只成功复读一次，内容变化后可再次触发
 - ✅ 可选触发冷却时间，防止机器人刷屏
 - ✅ 群设置持久化保存，重启不丢失
@@ -97,12 +97,16 @@ A：临时开启 `media_diagnostics`，在 Info 日志中检索 `[repeater.media
 A：删除 `main.py` 中 `on_group_message` 上方的 `@filter.platform_adapter_type(...)` 一行即可（保留群聊过滤即可）。
 
 **Q：数据存在哪里？**
-A：群设置保存在 AstrBot 的 `data/astrbot_plugin_repeater/state.json`，不在插件目录内，更新/重装插件不会丢失。
+A：群设置保存在 AstrBot 官方插件数据目录 `data/plugin_data/astrbot_plugin_repeater/state.json`（通过 `StarTools.get_data_dir()` 获取），不在插件自身目录内，更新/重装插件不会丢失，也便于统一备份与迁移。首次启动仅在官方状态文件缺失时，按有限兼容路径只读寻找旧 `state.json` 并迁移；官方状态文件一旦存在即为权威文件，损坏时保留原文件并停止自动覆盖。迁移不会移动、删除或改写旧文件。
 
 ## 开发与测试
 
 - 测试通过最小 AstrBot 桩真实导入 `main.py`，运行 `python -m unittest discover -s tests -v` 即可（无需启动 AstrBot）。
 - 依赖：无第三方库，仅使用 Python 标准库。
+
+## 更新日志
+
+版本变更记录见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可
 

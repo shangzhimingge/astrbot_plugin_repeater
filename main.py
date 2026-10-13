@@ -6,14 +6,17 @@
 #  - 支持触发冷却时间，防止机器人刷屏。
 #
 # 说明：核心逻辑在 process_message() 中，为纯同步函数，便于本地单元测试；
-#      事件监听 / 指令处理只是薄封装。持久化数据存放于 AstrBot 的 data 目录。
+#      事件监听 / 指令处理只是薄封装。状态存放于 AstrBot 官方插件数据目录。
 
 import asyncio
 import base64
+import errno
 import hashlib
 import json
+import math
 import os
 import re
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -23,7 +26,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import At, Face, Image, Plain
-from astrbot.api.star import Context, Star
+from astrbot.api.star import Context, Star, StarTools
 
 
 # 指令组：群内通过 `/复读机 子指令` 控制复读机
@@ -137,6 +140,8 @@ class RepeatPlugin(Star):
         super().__init__(context)
         self.config = config
         self._groups: dict[str, _GroupState] = {}
+        self._state_load_blocked = False
+        self._migration_pending = False
         self._state_file = self._data_dir() / "state.json"
         self._load_state()
         logger.info("复读机插件已加载，群状态数据文件: %s", self._state_file)
@@ -1524,64 +1529,180 @@ class RepeatPlugin(Star):
         return max(0.0, v)
 
     def _data_dir(self) -> Path:
-        """返回 AstrBot 的 data 目录下的专属数据目录。
+        """Return AstrBot's official plugin-owned data directory."""
+        return Path(StarTools.get_data_dir("astrbot_plugin_repeater"))
 
-        插件位于 data/plugins/<插件名>/main.py，因此 data 目录是
-        __file__ 向上三级。持久化数据不放进插件自身目录，防止插件
-        更新/重装时数据被覆盖。
-        """
-        p = Path(os.path.abspath(__file__))
-        candidates = [p.parents[2], Path(os.getcwd()) / "data"]
-        for base in candidates:
+    @staticmethod
+    def _state_file_exists(path: Path) -> bool:
+        return os.path.lexists(path)
+
+    def _legacy_state_files(self) -> list[Path]:
+        """Return the finite, ordered, read-only compatibility whitelist."""
+        official = self._state_file.resolve(strict=False)
+        module = Path(os.path.abspath(__file__))
+        candidates = [self._state_file.parent.parent.parent / "astrbot_plugin_repeater" / "state.json"]
+        # This historic layout is meaningful only for data/plugins/<plugin>/main.py.
+        if (
+            len(module.parents) > 2
+            and module.name == "main.py"
+            and module.parent.name == "astrbot_plugin_repeater"
+            and module.parent.parent.name == "plugins"
+            and module.parents[2].name == "data"
+        ):
+            candidates.append(module.parents[2] / "astrbot_plugin_repeater" / "state.json")
+        candidates.extend(
+            [
+                Path(os.path.abspath(os.getcwd())) / "data" / "astrbot_plugin_repeater" / "state.json",
+                module.parent / "state.json",
+            ]
+        )
+        seen = {os.path.normcase(os.path.abspath(official))}
+        result = []
+        for candidate in candidates:
+            normalized = Path(os.path.abspath(candidate))
+            key = os.path.normcase(str(normalized))
+            if key not in seen and key != os.path.normcase(str(official)):
+                seen.add(key)
+                result.append(normalized)
+        return result
+
+    def _parse_state_snapshot(self, path: Path) -> dict[str, _GroupState]:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("state root must be an object")
+        groups = raw.get("groups", {})
+        if not isinstance(groups, dict):
+            raise ValueError("groups must be an object")
+        parsed = {}
+        for gid, item in groups.items():
+            if not isinstance(item, dict):
+                raise ValueError("group settings must be objects")
+            enabled = item.get("enabled", self._default_enabled())
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled must be a Boolean")
+            threshold_value = item.get("threshold", self._default_threshold())
+            if isinstance(threshold_value, bool):
+                raise ValueError("threshold must be numeric")
+            threshold = int(threshold_value)
+            cooldown_value = item.get("cooldown", self._default_cooldown())
+            if isinstance(cooldown_value, bool):
+                raise ValueError("cooldown must be numeric")
+            cooldown = float(cooldown_value)
+            if not math.isfinite(cooldown):
+                raise ValueError("cooldown must be finite")
+            parsed[str(gid)] = _GroupState(
+                enabled=enabled,
+                threshold=max(2, min(50, threshold)),
+                cooldown=max(0.0, cooldown),
+            )
+        return parsed
+
+    def _adopt_official_target(self) -> bool:
+        try:
+            winner = self._parse_state_snapshot(self._state_file)
+        except Exception as e:
+            self._state_load_blocked = True
+            self._migration_pending = False
+            logger.warning("官方复读机状态文件无效，保留原文件并停止覆盖: %s", e)
+            return False
+        self._groups = winner
+        self._migration_pending = False
+        self._state_load_blocked = False
+        return True
+
+    def _write_temp_state(self) -> str:
+        self._state_file.parent.mkdir(parents=True, exist_ok=True)
+        data = {
+            "groups": {
+                gid: {
+                    "enabled": state.enabled,
+                    "threshold": state.threshold,
+                    "cooldown": state.cooldown,
+                }
+                for gid, state in self._groups.items()
+            }
+        }
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=self._state_file.parent,
+            prefix=f".{self._state_file.name}.", suffix=".tmp", delete=False,
+        )
+        try:
+            with handle:
+                handle.write(json.dumps(data, ensure_ascii=False, indent=2))
+                handle.flush()
+                os.fsync(handle.fileno())
+            return handle.name
+        except Exception:
             try:
-                target = base / "astrbot_plugin_repeater"
-                target.mkdir(parents=True, exist_ok=True)
-                return target
-            except Exception:
-                continue
-        return p.parent  # 最终兜底：插件自身目录
+                os.unlink(handle.name)
+            except OSError:
+                pass
+            raise
 
     def _load_state(self):
+        if self._state_file_exists(self._state_file):
+            self._adopt_official_target()
+            return
+        for source in self._legacy_state_files():
+            if not self._state_file_exists(source):
+                continue
+            try:
+                if source.is_symlink():
+                    continue
+                snapshot = self._parse_state_snapshot(source)
+            except Exception as e:
+                logger.warning("读取旧复读机状态失败，继续检查后续来源: %s", e)
+                continue
+            self._groups = snapshot
+            self._migration_pending = True
+            self._publish_migration()
+            return
+
+    @staticmethod
+    def _is_exists_error(error: OSError) -> bool:
+        return error.errno == errno.EEXIST or getattr(error, "winerror", None) == 183
+
+    def _publish_migration(self) -> bool:
+        if self._state_file_exists(self._state_file):
+            return self._adopt_official_target()
+        temporary = None
         try:
-            if not self._state_file.exists():
-                return
-            raw = json.loads(self._state_file.read_text(encoding="utf-8"))
-            for gid, item in (raw.get("groups") or {}).items():
-                state = _GroupState(
-                    enabled=bool(item.get("enabled", self._default_enabled())),
-                    threshold=max(
-                        2,
-                        min(
-                            50,
-                            int(item.get("threshold", self._default_threshold())),
-                        ),
-                    ),
-                    cooldown=max(
-                        0.0,
-                        float(item.get("cooldown", self._default_cooldown())),
-                    ),
-                )
-                self._groups[str(gid)] = state
+            temporary = self._write_temp_state()
+            try:
+                os.link(temporary, self._state_file)
+            except OSError as e:
+                if self._is_exists_error(e):
+                    return self._adopt_official_target()
+                raise
+            self._migration_pending = False
+            return True
         except Exception as e:
-            logger.warning("读取复读机群状态失败: %s", e)
+            logger.warning("迁移复读机状态失败，将在后续保存时重试: %s", e)
+            return False
+        finally:
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
     def _save_state(self):
+        if self._state_load_blocked:
+            return
+        if self._migration_pending:
+            self._publish_migration()
+            return
         try:
-            data = {
-                "groups": {
-                    gid: {
-                        "enabled": s.enabled,
-                        "threshold": s.threshold,
-                        "cooldown": s.cooldown,
-                    }
-                    for gid, s in self._groups.items()
-                }
-            }
-            self._state_file.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            temporary = self._write_temp_state()
+            os.replace(temporary, self._state_file)
         except Exception as e:
             logger.warning("保存复读机群状态失败: %s", e)
+        finally:
+            if "temporary" in locals():
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
     async def terminate(self):
         """插件被卸载/停用时保存状态。"""

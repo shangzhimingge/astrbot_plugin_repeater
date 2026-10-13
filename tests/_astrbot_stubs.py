@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+import tempfile
 import sys
 import types
+from pathlib import Path
 
 
 class _Logger:
@@ -139,6 +141,12 @@ class Star:
         self.context = context
 
 
+class StarTools:
+    @classmethod
+    def get_data_dir(cls, plugin_name=None):
+        return Path(tempfile.gettempdir()) / "astrbot-stub-plugin-data" / str(plugin_name)
+
+
 def install():
     existing = sys.modules.get("astrbot.api")
     if existing is not None and hasattr(existing, "logger"):
@@ -162,6 +170,7 @@ def install():
     components.Image = Image
     star.Context = object
     star.Star = Star
+    star.StarTools = StarTools
 
     astrbot.api = api
     api.event = event
